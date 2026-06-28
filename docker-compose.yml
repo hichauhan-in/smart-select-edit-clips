@@ -50,11 +50,9 @@ services:
     restart: unless-stopped
     environment:
       - VISION_BACKEND=ollama
-      #- VISION_BACKEND=lmstudio
       - OLLAMA_URL=http://host.docker.internal:11434
       - LMSTUDIO_URL=http://host.docker.internal:1234/v1/chat/completions
       - VISION_MODEL=llava:13b
-      #- VISION_MODEL=qwen2.5-vl-7b-instruct
     ports:
       - "8000:8000"
     volumes:

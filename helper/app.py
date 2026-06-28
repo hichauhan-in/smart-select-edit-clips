@@ -1,6 +1,7 @@
 import os, json, subprocess
 import shutil, glob, time
 import re, base64, requests
+import math
 
 from motion import motion_score
 from fastapi import FastAPI
@@ -410,6 +411,49 @@ def compute_fast_score(frame):
         + frame["ocr_norm"] * 0.30
     )
 
+def split_video_jobs(
+    duration_seconds,
+    max_minutes=15,
+    overlap_seconds=15
+):
+
+    max_duration = max_minutes * 60
+
+    if duration_seconds <= max_duration:
+        return [
+            {
+                "job": 1,
+                "start": 0.0,
+                "end": duration_seconds
+            }
+        ]
+
+    jobs = []
+
+    parts = math.ceil(
+        duration_seconds / max_duration
+    )
+
+    for i in range(parts):
+
+        start = i * max_duration
+
+        if i > 0:
+            start -= overlap_seconds
+
+        end = min(
+            (i + 1) * max_duration,
+            duration_seconds
+        )
+
+        jobs.append({
+            "job": i + 1,
+            "start": start,
+            "end": end
+        })
+
+    return jobs
+
 def _vision_score_ollama(
     frame_paths,
     motion,
@@ -676,19 +720,43 @@ def render_clip(source, start, end, output):
     print("STDERR:", result.stderr, flush=True)
     print("=" * 80, flush=True)
 
+
+def split_video(
+    source,
+    start,
+    end,
+    output
+):
+
+    duration = end - start
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-ss", str(start),
+            "-i", source,
+            "-t", str(duration),
+            "-c", "copy",
+            output
+        ],
+        check=True,
+        capture_output=True
+    )
+
+    return output
+
 def refine_candidate(
     video_path,
     approx_time,
     duration,
-    job_id,
+    job_dir,
     window=7.0,
     step=0.5
 ):
 
     work = os.path.join(
-        MEDIA,
-        "work",
-        job_id,
+        job_dir,
         "refine",
         f"candidate_{int(approx_time)}"
     )
@@ -757,13 +825,11 @@ def print_final_results(selected):
 def load_clip_frames(
     video_path,
     frame,
-    job_id
+    job_dir
 ):
 
     clip_dir = os.path.join(
-        MEDIA,
-        "work",
-        job_id,
+        job_dir,
         f"clip_{frame['idx']}"
     )
 
@@ -774,21 +840,17 @@ def load_clip_frames(
         clip_dir
     )
 
-@app.post("/candidates")
-def candidates(inp: CandIn):
-    full = os.path.join(MEDIA, inp.path)
-    dur = probe(ProbeIn(path=inp.path))["duration"]
+def process_job(
+    full,
+    dur,
+    inp,
+    job_dir,
+    job_start=0.0,
+    job_end=None
+):
 
-    #print("INPUT PATH:", repr(inp.path))
-    #info = probe(ProbeIn(path=inp.path))
-    #import sys
-
-    #print("=" * 80, flush=True)
-    #print(f"INPUT PATH: {repr(inp.path)}", flush=True)
-    #print(f"PROBE RESULT: {repr(info)}", flush=True)
-    #print("=" * 80, flush=True)
-    #sys.stdout.flush()
-    #dur = info["duration"]
+    if job_end is None:
+        job_end = dur
 
     sample_times = detect_scenes(full)
 
@@ -815,9 +877,7 @@ def candidates(inp: CandIn):
     )
 
     frames_dir = os.path.join(
-        MEDIA,
-        "work",
-        inp.jobId,
+        job_dir,
         "frames"
     )
 
@@ -830,8 +890,7 @@ def candidates(inp: CandIn):
         fp = os.path.join(frames_dir, f"cand_{i}.jpg")
         _extract_frame(full, t, fp)
         frames.append({
-            "idx": i, "time": t, "start": start, "end": end, "frame":fp,
-            "frame_rel": f"work/{inp.jobId}/frames/cand_{i}.jpg"
+            "idx": i, "time": t, "start": start, "end": end, "frame":fp
         })
     print(f"Extracted {len(frames)} frames", flush=True)
     
@@ -849,8 +908,7 @@ def candidates(inp: CandIn):
 
         motion_frames.append({
             "idx": curr["idx"], "time": curr["time"], 
-            "start": curr["start"], "end": curr["end"], 
-            "frame": curr["frame"], "frame_rel": curr["frame_rel"],
+            "start": curr["start"], "end": curr["end"],
             "motion": motion, "yolo": yolo, "yolo_hits": yolo_hits
         })
     
@@ -879,7 +937,7 @@ def candidates(inp: CandIn):
             full,
             frame["time"],
             dur,
-            inp.jobId
+            job_dir
         )
 
         frame["time"] = refined_time
@@ -910,7 +968,11 @@ def candidates(inp: CandIn):
     scored = []
     for frame in interesting:
 
-        clip_frames = load_clip_frames(full, frame, inp.jobId)
+        clip_frames = load_clip_frames(
+            full,
+            frame,
+            job_dir
+        )
 
         ocr_points, ocr_text, ocr_hits = ocr_score(clip_frames[2])
 
@@ -956,7 +1018,7 @@ def candidates(inp: CandIn):
 
     for frame in interesting:
 
-        clip_frames = load_clip_frames(full, frame, inp.jobId)
+        clip_frames = load_clip_frames(full, frame, job_dir)
 
         gameplay, approve, confidence, reason = _vision_score(
             clip_frames,
@@ -1000,10 +1062,128 @@ def candidates(inp: CandIn):
 
     print_final_results(selected)
 
+    return selected
+
+@app.post("/candidates")
+def candidates(inp: CandIn):
+    full = os.path.join(MEDIA, inp.path)
+    dur = probe(ProbeIn(path=inp.path))["duration"]
+    jobs = split_video_jobs(dur)
+
+    print(
+        "\n========== VIDEO JOBS ==========",
+        flush=True
+    )
+
+    for job in jobs:
+        print(
+            job,
+            flush=True
+        )
+
+    print(
+        "================================\n",
+        flush=True
+    )
+    
+    all_selected = []
+
+    for job in jobs:
+
+        print(
+            f"\nProcessing Job {job['job']}",
+            flush=True
+        )
+
+        if len(jobs) == 1:
+            job_dir = os.path.join(
+                MEDIA,
+                "work",
+                inp.jobId
+            )
+        else:
+            job_dir = os.path.join(
+                MEDIA,
+                "work",
+                inp.jobId,
+                f"segment_{job['job']}"
+            )
+
+        os.makedirs(
+            job_dir,
+            exist_ok=True
+        )
+
+        if len(jobs) == 1:
+
+            segment = full
+
+        else:
+
+            segment = os.path.join(
+                job_dir,
+                "source.mp4"
+            )
+
+            split_video(
+                full,
+                job["start"],
+                job["end"],
+                segment
+            )
+
+        segment_duration = (
+            job["end"] -
+            job["start"]
+        )
+
+        selected = process_job(
+            segment,
+            segment_duration,
+            inp,
+            job_dir
+        )
+
+        for frame in selected:
+
+            frame["time"] += job["start"]
+            frame["start"] += job["start"]
+            frame["end"] += job["start"]
+
+        all_selected.extend(selected)
+
+    #print("INPUT PATH:", repr(inp.path))
+    #info = probe(ProbeIn(path=inp.path))
+    #import sys
+
+    #print("=" * 80, flush=True)
+    #print(f"INPUT PATH: {repr(inp.path)}", flush=True)
+    #print(f"PROBE RESULT: {repr(info)}", flush=True)
+    #print("=" * 80, flush=True)
+    #sys.stdout.flush()
+    #dur = info["duration"]
+
+    all_selected.sort(
+        key=lambda x: x["final_score"],
+        reverse=True
+    )
+
+    final = []
+
+    for frame in all_selected:
+
+        if all(
+            abs(frame["time"] - f["time"]) >= 30
+            for f in final
+        ):
+                final.append(frame)
+
     return {
         "dur": dur,
-        "candidates": selected
+        "candidates": final
     }
+
+    
 
 @app.post("/render")
 def render(inp: RenderIn):
