@@ -2,6 +2,7 @@ import os, json, subprocess
 import shutil, glob, time
 import re, base64, requests
 import math
+import numpy as np
 
 from motion import motion_score
 from fastapi import FastAPI
@@ -74,6 +75,14 @@ VISION_MODEL = os.environ.get(
     "llava:13b"
 )
 
+# Hard cap on the coarse whole-segment scan. When scene detection is weak we
+# fall back to fixed-interval sampling; a 15-minute segment at 2s would be
+# ~450 frames, and every frame costs an ffmpeg extract + a YOLO inference.
+# That stage is the heaviest in the pipeline and can exhaust container memory
+# on long segments. We widen the interval so the coarse scan never exceeds
+# this many frames (still far more than topMotion needs to pick from).
+MAX_COARSE_FRAMES = int(os.environ.get("MAX_COARSE_FRAMES", "160"))
+
 print("Loading YOLO...", flush=True)
 YOLO_MODEL = YOLO("yolov8n.pt")
 print("YOLO loaded.", flush=True)
@@ -135,16 +144,44 @@ ocr = easyocr.Reader(
 
 print("EasyOCR loaded.", flush=True)
 
-def _loudness_curve(full):
-    """Return (times[], momentary_LUFS[]) using ffmpeg's ebur128 meter."""
-    cmd = ["ffmpeg", "-nostats", "-i", full, "-af", "ebur128=metadata=1", "-f", "null", "-"]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+def _loudness_curve(full, hop=0.25):
+    """
+    Return (times[], loudness_dbfs[]) for the whole file.
+
+    We decode the audio to mono 16 kHz PCM and compute RMS loudness (in dBFS)
+    over short hops. This is far more reliable than scraping ffmpeg's ebur128
+    stderr output, whose line format differs between ffmpeg builds and was
+    silently producing zero samples here.
+    """
+    cmd = [
+        "ffmpeg", "-nostats", "-v", "error",
+        "-i", full,
+        "-vn", "-ac", "1", "-ar", "16000",
+        "-f", "s16le", "-"
+    ]
+    p = subprocess.run(cmd, capture_output=True)
+
+    if not p.stdout:
+        return [], []
+
+    samples = np.frombuffer(p.stdout, dtype=np.int16)
+
+    if samples.size == 0:
+        return [], []
+
+    audio = samples.astype(np.float32) / 32768.0
+
+    sr = 16000
+    win = max(1, int(hop * sr))
+
     times, vals = [], []
-    for line in p.stderr.splitlines():
-        m = re.search(r"t:\s*([0-9.]+).*?M:\s*(-?[0-9.]+)", line)
-        if m:
-            times.append(float(m.group(1)))
-            vals.append(float(m.group(2)))
+    for i in range(0, audio.size - win + 1, win):
+        chunk = audio[i:i + win]
+        rms = float(np.sqrt(np.mean(chunk * chunk)) + 1e-9)
+        db = 20.0 * math.log10(rms)
+        times.append(i / sr)
+        vals.append(db)
+
     return times, vals
 
 def _pick_peaks(times, vals, k, min_gap):
@@ -158,6 +195,34 @@ def _pick_peaks(times, vals, k, min_gap):
         if len(chosen) >= k:
             break
     return chosen
+
+def clip_audio_score(times, vals, start, end):
+    """
+    Smart loudness for a single clip window.
+
+    Raw loudness is a bad highlight signal: a person speaking loudly into the
+    mic stays loud the whole time and would always score high. Instead we score
+    the largest short-term LOUDNESS JUMP inside the window.
+
+    Sudden transients (gunfire, explosions, kill / reward stingers) cause big
+    jumps; sustained speech or background music stays flat and scores low.
+    """
+    window = [
+        (t, v)
+        for t, v in zip(times, vals)
+        if start <= t <= end
+    ]
+
+    if len(window) < 2:
+        return 0.0
+
+    best_jump = 0.0
+    for i in range(1, len(window)):
+        jump = window[i][1] - window[i - 1][1]
+        if jump > best_jump:
+            best_jump = jump
+
+    return best_jump
 
 def _extract_frame(full, t, out_path):
     subprocess.run(["ffmpeg", "-y", "-ss", str(t), "-i", full,
@@ -225,7 +290,8 @@ def _extract_clip_frames(full, start, end, out_dir):
 def build_cv_summary(
     motion,
     yolo,
-    ocr
+    ocr,
+    audio
 ):
 
     summary = []
@@ -257,68 +323,86 @@ def build_cv_summary(
     else:
         summary.append("No reward text detected.")
 
+    if audio >= 0.80:
+        summary.append("Strong impact sounds detected.")
+    elif audio >= 0.50:
+        summary.append("Some impact sounds detected.")
+    elif audio >= 0.20:
+        summary.append("Faint impact sounds detected.")
+    else:
+        summary.append("No notable impact sounds detected.")
+
     return summary
 
 def build_prompt(
     motion,
     yolo,
-    ocr
+    ocr,
+    audio,
+    clip_len
 ):
 
     cv_summary = build_cv_summary(
         motion,
         yolo,
-        ocr
+        ocr,
+        audio
     )
 
     return f"""
-The frames are ordered chronologically.
+You are an expert esports highlight curator.
 
-Frame 1 is the beginning of the clip.
-Frame 5 is the end of the clip.
+You are given 5 frames sampled from ONE single {clip_len:.0f}-second gameplay clip.
+The frames are in chronological order:
 
-Judge the progression of the action across all frames instead of treating each image independently.
+Frame 1  ~  0%  (start of the clip)
+Frame 2  ~ 25%
+Frame 3  ~ 50%  (middle)
+Frame 4  ~ 75%
+Frame 5  ~ 95%  (end of the clip)
 
-These are 5 frames taken from the SAME 15-second gameplay clip.
+Judge the clip as ONE continuous moment. Read the progression of the
+action across the 5 frames instead of rating each image on its own.
 
-These frames have ALREADY been selected by an automated highlight detection pipeline.
+These frames were already pre-selected by an automated highlight
+detection pipeline, so they are likely (but not guaranteed) interesting.
 
-Computer Vision Analysis
+--- Computer Vision Analysis ---
+These scores are RELATIVE to the other candidate clips detected in THIS
+video (1.00 = strongest among the candidates, 0.00 = weakest). They are
+NOT absolute quality measures, so treat them as ranking hints, not truth.
 
-Motion Score : {motion:.2f}
-YOLO Score   : {yolo:.2f}
-OCR Score    : {ocr:.2f}
+Motion Score : {motion:.2f}   (relative amount of on-screen movement)
+YOLO Score   : {yolo:.2f}   (relative object count - weak signal, low weight)
+OCR Score    : {ocr:.2f}   (relative reward text such as HEADSHOT, KILL, VICTORY, ACE)
+Audio Score  : {audio:.2f}   (relative impact sounds: gunfire, explosions, reward stingers - NOT loud talking)
 
 Summary:
 {chr(10).join(cv_summary)}
 
-Interpretation:
+--- Your task ---
+1. gameplay : true ONLY if these frames clearly show real, live video-game
+   gameplay. Set gameplay = false for anything that is not live gameplay,
+   including: advertisements, sponsor / promotional / brand screens or
+   logos, intros, outros, menus, loading screens, scoreboards, desktop,
+   webcam / face-cam, black screens, OR frozen / static frames where almost
+   nothing changes across the 5 frames.
+2. approve  : true only if this is genuinely highlight-worthy. Reject
+   (approve = false) advertisements, promos, intros / outros, and static
+   or idle moments even if a game image is technically visible.
+3. confidence : how strong this highlight is (see guide below).
+4. Use the CV scores as supporting evidence:
+   - If the visuals agree with the scores, raise your confidence.
+   - If the scores look misleading (e.g. high motion but nothing happens),
+     lower your confidence.
 
-• Motion measures how dynamic the scene is.
-• YOLO estimates how many important gameplay objects are visible.
-• OCR detects reward text such as HEADSHOT, KILL, VICTORY, ACE, etc.
-
-Your task is NOT to score this clip from scratch.
-
-Instead:
-
-1. Decide whether these frames show genuine gameplay.
-2. Decide whether this is actually highlight-worthy.
-3. Use the Computer Vision scores as evidence.
-4. If the Computer Vision scores appear misleading, reduce your confidence.
-5. If they agree with what you see, increase your confidence.
-
-Return ONLY valid JSON.
-
-{{
-    "gameplay": true,
-    "approve": true,
-    "confidence": 0.0,
-    "reason": "short reason under 12 words"
-}}
+Consistency rules:
+- If gameplay is false, approve MUST be false and confidence MUST be 0.00.
+- If approve is false, confidence MUST be <= 0.30.
+- If the 5 frames look almost identical (no real change), treat it as
+  static: gameplay = false and confidence = 0.00.
 
 Confidence guide:
-
 1.00 = Exceptional highlight
 0.90 = Excellent gameplay
 0.80 = Strong highlight
@@ -326,11 +410,17 @@ Confidence guide:
 0.60 = Average gameplay
 0.40 = Weak highlight
 0.20 = Probably not a highlight
-0.00 = Not gameplay or definitely reject
+0.00 = Not gameplay / definitely reject
 
-Never return markdown.
-Never explain your answer.
-Return JSON only.
+Return ONLY this JSON object, nothing else:
+{{
+    "gameplay": true,
+    "approve": true,
+    "confidence": 0.0,
+    "reason": "short reason under 12 words"
+}}
+
+Never return markdown. Never explain. Return JSON only.
 """
 
 def parse_vision_response(data):
@@ -407,8 +497,9 @@ def compute_fast_score(frame):
 
     return (
         frame["motion_norm"] * 0.40
-        + frame["yolo_norm"] * 0.30
-        + frame["ocr_norm"] * 0.30
+        + frame["ocr_norm"] * 0.35
+        + frame["audio_norm"] * 0.15
+        + frame["yolo_norm"] * 0.10
     )
 
 def split_video_jobs(
@@ -458,7 +549,9 @@ def _vision_score_ollama(
     frame_paths,
     motion,
     yolo,
-    ocr
+    ocr,
+    audio,
+    clip_len
 ):
     try:
         images = []
@@ -469,7 +562,7 @@ def _vision_score_ollama(
                     base64.b64encode(f.read()).decode()
                 )
 
-        prompt = build_prompt(motion, yolo, ocr)
+        prompt = build_prompt(motion, yolo, ocr, audio, clip_len)
 
         #r = requests.post(f"{OLLAMA}/api/generate", json={
         #    "model": VISION_MODEL, "prompt": prompt, "images": [b64],
@@ -487,7 +580,8 @@ def _vision_score_ollama(
             "prompt": prompt,
             "images": images,
             "stream": False,
-            "format": "json"
+            "format": "json",
+            "options": {"temperature": 0}
         },
         timeout=180
         )
@@ -509,7 +603,9 @@ def _vision_score_lmstudio(
     frame_paths,
     motion,
     yolo,
-    ocr
+    ocr,
+    audio,
+    clip_len
 ):
 
     try:
@@ -530,7 +626,7 @@ def _vision_score_lmstudio(
             })
 
 
-        prompt = build_prompt(motion, yolo, ocr)
+        prompt = build_prompt(motion, yolo, ocr, audio, clip_len)
 
         content = [
             {
@@ -585,7 +681,9 @@ def _vision_score(
     frame_paths,
     motion,
     yolo,
-    ocr
+    ocr,
+    audio,
+    clip_len
 ):
 
     print("\n" + "=" * 70, flush=True)
@@ -600,7 +698,9 @@ def _vision_score(
             frame_paths,
             motion,
             yolo,
-            ocr
+            ocr,
+            audio,
+            clip_len
         )
 
     elif VISION_BACKEND == "lmstudio":
@@ -608,7 +708,9 @@ def _vision_score(
             frame_paths,
             motion,
             yolo,
-            ocr
+            ocr,
+            audio,
+            clip_len
         )
 
     raise ValueError(
@@ -619,26 +721,51 @@ class CandIn(BaseModel):
     path: str
     jobId: str
     clipLen: float = 15.0
-    count: int = 4
-    minGap: float = 8.0
+    sampleInterval: float = 2.0
+    topMotion: int = 20
+    finalCandidates: int = 4
+    # 0 == "auto": fall back to one clip length so highlights can sit
+    # back-to-back instead of being forced 30 s apart.
+    minGap: float = 0.0
+    # 0 == no cap. When > 0, the merged result (across all segments of a long
+    # video) is trimmed to at most this many clips, keeping the highest scored.
+    maxCandidates: int = 0
 
 class RenderClip(BaseModel):
     start: float
     end: float
+    # Best-to-worst position (1 = best). Used only to name the output file so
+    # the editor / uploader can post them in order. 0 == fall back to index.
+    rank: int = 0
 
 
 class RenderIn(BaseModel):
     path: str
     jobId: str
     clips: list[RenderClip]
+    # Output framing. "9:16" = YouTube/Instagram Shorts (default), "4:5",
+    # "1:1", "16:9", or "source" to keep the original frame untouched.
+    aspect: str = "9:16"
+    # How to reach the target aspect:
+    #   "center" - crop the centre strip and fill the frame (most engaging
+    #              for gameplay, but loses the left/right edges)
+    #   "blur"   - whole frame fitted over a zoomed, blurred copy of itself
+    #              (keeps all gameplay + HUD, no hard black bars)
+    #   "fit"    - whole frame letterboxed on black
+    cropMode: str = "center"
+    # Fade-in / fade-out duration in seconds (0 disables).
+    fade: float = 0.5
 
-def detect_scenes(full):
+def detect_scenes(full, min_threshold=0.12):
 
+    # One decode pass at a low threshold surfaces every candidate cut together
+    # with its scene_score, so the caller can pick an effective threshold in
+    # Python (adaptive) instead of re-decoding the video several times.
     cmd = [
         "ffmpeg",
         "-i", full,
         "-filter:v",
-        "select='gt(scene,0.30)',showinfo",
+        f"select='gt(scene,{min_threshold})',metadata=print",
         "-vsync", "0",
         "-f", "null",
         "-"
@@ -650,16 +777,30 @@ def detect_scenes(full):
         text=True
     )
 
-    times = []
+    pairs = []
+    cur_time = None
 
     for line in p.stderr.splitlines():
 
         m = re.search(r"pts_time:([0-9.]+)", line)
-
         if m:
-            times.append(float(m.group(1)))
+            cur_time = float(m.group(1))
+            continue
 
-    return times
+        ms = re.search(r"scene_score=([0-9.]+)", line)
+        if ms and cur_time is not None:
+            pairs.append((cur_time, float(ms.group(1))))
+            cur_time = None
+
+    # Older/edge ffmpeg builds may not surface scene_score lines. Fall back to
+    # treating every selected frame as a cut at the minimum threshold.
+    if not pairs:
+        for line in p.stderr.splitlines():
+            m = re.search(r"pts_time:([0-9.]+)", line)
+            if m:
+                pairs.append((float(m.group(1)), min_threshold))
+
+    return pairs
 
 def ocr_score(image_path):
 
@@ -682,7 +823,33 @@ def ocr_score(image_path):
             matched.append(word)
 
     return score, text, matched
-    
+
+def ocr_score_frames(frame_paths):
+    """
+    Run OCR over several frames of one clip and keep the strongest hit.
+
+    Reward text (e.g. "DOUBLE KILL") often flashes for ~1 second and is gone by
+    the middle frame, so scanning only the 50% frame misses it. We score every
+    frame and take the max, merging the matched words and the text of the
+    best-scoring frame.
+    """
+    best_score = 0
+    best_text = ""
+    all_hits = []
+
+    for fp in frame_paths:
+        score, text, hits = ocr_score(fp)
+
+        if score > best_score:
+            best_score = score
+            best_text = text
+
+        for h in hits:
+            if h not in all_hits:
+                all_hits.append(h)
+
+    return best_score, best_text, all_hits
+
 def sample_video(duration, interval=2.0):
     times = []
 
@@ -694,22 +861,174 @@ def sample_video(duration, interval=2.0):
 
     return times
 
-def render_clip(source, start, end, output):
+def audio_peak_times(times, vals, min_gap, max_peaks):
+    """
+    Pick the timestamps where loudness JUMPS the most.
+
+    A sudden rise in loudness is the onset of a loud event - a gunshot,
+    explosion, hit or shout - which is exactly where highlights live. We rank
+    by the size of the rise from the previous sample and keep the strongest,
+    spaced at least ``min_gap`` seconds apart so one loud burst doesn't claim
+    every slot.
+    """
+    if not times or len(times) < 3:
+        return []
+
+    rises = []
+    for i in range(1, len(vals)):
+        rise = vals[i] - vals[i - 1]
+        if rise > 0:
+            rises.append((rise, times[i]))
+
+    rises.sort(reverse=True)
+
+    kept = []
+    for _, t in rises:
+        if all(abs(t - k) >= min_gap for k in kept):
+            kept.append(t)
+        if len(kept) >= max_peaks:
+            break
+
+    return sorted(kept)
+
+def merge_seed_times(*lists, min_gap, max_count):
+    """
+    Merge candidate timestamps from several sources into one clean list.
+
+    Times closer than ``min_gap`` collapse to one (a scene cut and an audio
+    peak a fraction of a second apart are the same moment), and the result is
+    thinned uniformly if it still exceeds ``max_count``.
+    """
+    times = sorted({
+        round(t, 2)
+        for lst in lists
+        for t in lst
+    })
+
+    kept = []
+    for t in times:
+        if not kept or t - kept[-1] >= min_gap:
+            kept.append(t)
+
+    if len(kept) > max_count:
+        step = len(kept) / max_count
+        kept = [kept[int(i * step)] for i in range(max_count)]
+
+    return kept
+
+# Target pixel size for each supported aspect ratio. Shorts/Reels/TikTok all
+# use 1080x1920; the rest follow the same 1080-wide convention. "source"
+# (None) keeps the original frame size.
+ASPECT_DIMS = {
+    "9:16": (1080, 1920),
+    "4:5": (1080, 1350),
+    "1:1": (1080, 1080),
+    "16:9": (1920, 1080),
+    "source": None,
+}
+
+
+def build_video_filter(aspect, crop_mode, fade_dur, duration):
+    """
+    Build the ffmpeg filter for reframing a clip to ``aspect`` with the chosen
+    ``crop_mode`` plus optional fade in/out.
+
+    Returns ``(flag, filter_string, extra_maps)`` where ``flag`` is either
+    ``"-vf"`` (single chain) or ``"-filter_complex"`` (blur needs a split), and
+    ``extra_maps`` are any explicit ``-map`` args the complex graph requires.
+    """
+    dims = ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"])
+
+    fades = ""
+    if fade_dur and fade_dur > 0 and duration > 2 * fade_dur:
+        out_start = max(0.0, duration - fade_dur)
+        fades = (
+            f",fade=t=in:st=0:d={fade_dur}"
+            f",fade=t=out:st={out_start:.3f}:d={fade_dur}"
+        )
+
+    # Keep the original frame size, just (optionally) fade.
+    if dims is None:
+        return "-vf", "null" + fades, []
+
+    W, H = dims
+
+    if crop_mode == "blur":
+        # Whole frame fitted onto a zoomed, blurred copy of itself - nothing is
+        # cropped away and there are no hard black bars.
+        fc = (
+            f"[0:v]split=2[bg][fg];"
+            f"[bg]scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H},gblur=sigma=25[bg2];"
+            f"[fg]scale={W}:{H}:force_original_aspect_ratio=decrease[fg2];"
+            f"[bg2][fg2]overlay=(W-w)/2:(H-h)/2"
+            f"{fades}[v]"
+        )
+        return "-filter_complex", fc, ["-map", "[v]", "-map", "0:a?"]
+
+    if crop_mode == "fit":
+        chain = (
+            f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black"
+            f"{fades}"
+        )
+        return "-vf", chain, []
+
+    # Default "center": crop the centre strip to the target aspect, then scale.
+    chain = (
+        f"crop='min(iw,ih*{W}/{H})':'min(ih,iw*{H}/{W})',"
+        f"scale={W}:{H}"
+        f"{fades}"
+    )
+    return "-vf", chain, []
+
+
+def render_clip(
+    source,
+    start,
+    end,
+    output,
+    aspect="9:16",
+    crop_mode="center",
+    fade=0.5
+):
 
     duration = end - start
 
+    flag, filter_string, extra_maps = build_video_filter(
+        aspect,
+        crop_mode,
+        fade,
+        duration
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss", str(start),
+        "-i", source,
+        "-t", str(duration),
+        flag, filter_string,
+    ]
+
+    cmd += extra_maps
+
+    cmd += [
+        # crf 18 + faststart keeps the clip visually near-lossless and ready
+        # for instant web playback; the source resolution is preserved unless
+        # an aspect crop/scale was requested above.
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+        output
+    ]
+
     result = subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-ss", str(start),
-            "-i", source,
-            "-t", str(duration),
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-c:a", "aac",
-            output
-        ],
+        cmd,
         capture_output=True,
         text=True
     )
@@ -717,6 +1036,7 @@ def render_clip(source, start, end, output):
     print("=" * 80, flush=True)
     print("FFMPEG RETURN:", result.returncode, flush=True)
     print("OUTPUT FILE:", output, flush=True)
+    print("ASPECT:", aspect, "CROP:", crop_mode, flush=True)
     print("STDERR:", result.stderr, flush=True)
     print("=" * 80, flush=True)
 
@@ -762,44 +1082,66 @@ def refine_candidate(
     )
     os.makedirs(work, exist_ok=True)
 
-    best_time = approx_time
-    best_motion = -1
+    start = max(0.0, approx_time - window)
+    end = min(duration, approx_time + window)
+    span = end - start
 
+    if span <= 0:
+        return approx_time, 0.0, 0.0
+
+    fps = 1.0 / step
+
+    # One ffmpeg pass dumps the whole window as frames, instead of spawning
+    # ~(2*window/step) separate ffmpeg processes.
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-ss", str(start),
+            "-i", video_path,
+            "-t", str(span),
+            "-vf", f"fps={fps}",
+            "-q:v", "3",
+            os.path.join(work, "f_%04d.jpg")
+        ],
+        capture_output=True
+    )
+
+    frames = sorted(glob.glob(os.path.join(work, "f_*.jpg")))
+
+    best_time = approx_time
+    best_motion = -1.0
+    motion_sum = 0.0
+    motion_count = 0
     prev_frame = None
 
-    t = max(0.0, approx_time - window)
-
-    while t <= min(duration, approx_time + window):
-
-        img = os.path.join(
-            work,
-            f"{int(t*1000)}.jpg"
-        )
-
-        _extract_frame(video_path, t, img)
+    for i, img in enumerate(frames):
 
         if prev_frame is not None:
 
-            m = motion_score(
-                prev_frame,
-                img
-            )
+            m = motion_score(prev_frame, img)
+
+            motion_sum += m
+            motion_count += 1
 
             if m > best_motion:
                 best_motion = m
-                best_time = t
+                # frame i was sampled at time start + i / fps
+                best_time = start + i / fps
 
         prev_frame = img
 
-        t += step
+    # Sustained motion = average frame-to-frame change across the whole window.
+    # It represents how action-packed the clip really is, and (unlike the single
+    # peak) is not faked by one scene cut inside the window.
+    mean_motion = motion_sum / motion_count if motion_count else 0.0
 
     print(
         f"Refined {approx_time:.2f}s -> {best_time:.2f}s "
-        f"(motion={best_motion:.2f})",
+        f"(peak={best_motion:.2f}, mean={mean_motion:.2f})",
         flush=True
     )
 
-    return best_time, best_motion
+    return best_time, best_motion, mean_motion
 
 
 def print_final_results(selected):
@@ -814,6 +1156,7 @@ def print_final_results(selected):
             f"Motion={frame['motion_norm']:.2f} | "
             f"YOLO={frame['yolo_norm']:.2f} | "
             f"OCR={frame['ocr_norm']:.2f} | "
+            f"Audio={frame['audio_norm']:.2f} | "
             f"Gameplay={frame['gameplay']} "
             f"Approve={frame['approve']} "
             f"Confidence={frame['confidence']:.2f} "
@@ -828,17 +1171,27 @@ def load_clip_frames(
     job_dir
 ):
 
+    # OCR and vision both ask for the same 5 clip frames. Extract once,
+    # then reuse the cached paths (frame start/end no longer change here).
+    cached = frame.get("clip_frames")
+    if cached and all(os.path.exists(p) for p in cached):
+        return cached
+
     clip_dir = os.path.join(
         job_dir,
+        "clips",
         f"clip_{frame['idx']}"
     )
 
-    return _extract_clip_frames(
+    clip_frames = _extract_clip_frames(
         video_path,
         frame["start"],
         frame["end"],
         clip_dir
     )
+
+    frame["clip_frames"] = clip_frames
+    return clip_frames
 
 def process_job(
     full,
@@ -852,23 +1205,87 @@ def process_job(
     if job_end is None:
         job_end = dur
 
-    sample_times = detect_scenes(full)
-
-    print(
-        f"Detected {len(sample_times)} scene changes",
-        flush=True
-    )
-
-    # Fallback if scene detection found too few scenes
-    if len(sample_times) < 20:
+    # Smart-loudness curve for the whole segment (computed once).
+    # Used later to score each clip by its loudest sudden impact sound.
+    audio_times, audio_vals = _loudness_curve(full)
+    if audio_vals:
         print(
-            "Too few scene changes. Falling back to 2-second sampling.",
+            f"Audio loudness samples: {len(audio_times)} "
+            f"(min={min(audio_vals):.1f} dBFS, max={max(audio_vals):.1f} dBFS)",
+            flush=True
+        )
+    else:
+        print(
+            "Audio loudness samples: 0 (no audio decoded)",
             flush=True
         )
 
-        sample_times = sample_video(
-            dur,
-            interval=2.0
+    # ---- Candidate seeding -------------------------------------------------
+    # Where should we take a first cheap look? Three sources, best first, so we
+    # look where something actually happens instead of sampling blindly:
+    #   1. Scene cuts  - the picture changed a lot (new room, kill cam, etc).
+    #   2. Audio peaks - loudness jumped (gunshot, explosion, hit, shout).
+    #   3. Uniform grid - last-resort backstop so we never come up empty.
+
+    # One decode pass gives every cut + its scene_score; we then relax the
+    # threshold in Python until we have enough cuts. Quiet gameplay rarely
+    # trips the strict 0.30, so the adaptive step keeps us off the dumb grid.
+    scene_pairs = detect_scenes(full)
+
+    scene_threshold = 0.30
+    scene_times = []
+    for scene_threshold in (0.30, 0.20, 0.12):
+        scene_times = [
+            t for (t, s) in scene_pairs
+            if s >= scene_threshold
+        ]
+        if len(scene_times) >= 20:
+            break
+
+    print(
+        f"Detected {len(scene_times)} scene cuts "
+        f"(threshold {scene_threshold:.2f})",
+        flush=True
+    )
+
+    # Audio peaks come for free from the loudness curve computed above.
+    peak_times = audio_peak_times(
+        audio_times,
+        audio_vals,
+        min_gap=max(2.0, inp.clipLen / 2),
+        max_peaks=MAX_COARSE_FRAMES
+    )
+
+    print(
+        f"Found {len(peak_times)} audio peaks",
+        flush=True
+    )
+
+    # Merge the two smart signals, collapsing near-duplicates and capping count.
+    sample_times = merge_seed_times(
+        scene_times,
+        peak_times,
+        min_gap=max(1.0, inp.clipLen / 4),
+        max_count=MAX_COARSE_FRAMES
+    )
+
+    # Last-resort backstop: if scene + audio were too sparse (flat, silent
+    # footage), add a capped uniform grid so the segment is still scanned.
+    if len(sample_times) < 20:
+        interval = inp.sampleInterval
+        if dur / interval > MAX_COARSE_FRAMES:
+            interval = dur / MAX_COARSE_FRAMES
+
+        print(
+            f"Sparse seeds. Adding {interval:.1f}-second grid backstop.",
+            flush=True
+        )
+
+        sample_times = merge_seed_times(
+            sample_times,
+            sample_video(dur, interval=interval),
+            min_gap=max(1.0, inp.clipLen / 4),
+            max_count=MAX_COARSE_FRAMES
         )
 
     print(
@@ -921,7 +1338,7 @@ def process_job(
 
     candidate_count = max(
         2,
-        min(12, max_possible // 2)
+        min(inp.topMotion, max_possible)
     )
 
     print(
@@ -931,17 +1348,26 @@ def process_job(
 
     interesting = motion_frames[:candidate_count]
 
+    # Refine search window scales with the clip (clipLen / 3), clamped so it
+    # is never less than 7 s or more than 15 s on each side of the motion peak.
+    # e.g. 10 s -> 7, 15 s -> 7, 30 s -> 10, 45 s and up -> 15.
+    refine_window = max(7.0, min(inp.clipLen / 3.0, 15.0))
+
     for frame in interesting:
 
-        refined_time, refined_motion = refine_candidate(
+        refined_time, refined_peak, refined_mean = refine_candidate(
             full,
             frame["time"],
             dur,
-            job_dir
+            job_dir,
+            window=refine_window
         )
 
         frame["time"] = refined_time
-        frame["motion"] = refined_motion
+        # Score on sustained (mean) intra-window motion, not the single peak,
+        # so a lone scene cut inside the window can't fake a high-action clip.
+        # The peak still decides where to center the clip (refined_time).
+        frame["motion"] = refined_mean
 
         frame["start"] = max(
             0,
@@ -974,15 +1400,23 @@ def process_job(
             job_dir
         )
 
-        ocr_points, ocr_text, ocr_hits = ocr_score(clip_frames[2])
+        ocr_points, ocr_text, ocr_hits = ocr_score_frames(clip_frames)
 
         frame["ocr"] = ocr_points
         frame["ocr_text"] = ocr_text
         frame["ocr_hits"] = ocr_hits
 
+        frame["audio"] = clip_audio_score(
+            audio_times,
+            audio_vals,
+            frame["start"],
+            frame["end"]
+        )
+
         print(
             f"OCR={frame['ocr']:.1f}",
             f"Hits={ocr_hits}",
+            f"Audio={frame['audio']:.1f}",
             f"Text={frame['ocr_text'][:80]}",
             flush=True
         )
@@ -995,6 +1429,8 @@ def process_job(
     normalize_feature(scored, "yolo", "yolo_norm")
 
     normalize_feature(scored, "ocr", "ocr_norm")
+
+    normalize_feature(scored, "audio", "audio_norm")
 
     for frame in scored:
 
@@ -1024,7 +1460,9 @@ def process_job(
             clip_frames,
             frame["motion_norm"],
             frame["yolo_norm"],
-            frame["ocr_norm"]
+            frame["ocr_norm"],
+            frame["audio_norm"],
+            inp.clipLen
         )
 
         frame["gameplay"] = gameplay
@@ -1036,29 +1474,64 @@ def process_job(
                 f"Rejected by Vision: {reason}",
                 flush=True
             )
+            # Drop the score so a rejected clip can never win
+            frame["final_score"] = 0.0
             continue
 
-        # Add LLaVA's opinion to the existing fast score
-        frame["final_score"] *= confidence
+        # Blend the vision model's confidence into the fast score.
+        # llava is unreliable at the confidence NUMBER: it frequently returns
+        # 0.00 for clips it simultaneously approves and calls "highlight-worthy".
+        # A raw multiply would wrongly zero those good clips, so instead map
+        # confidence onto a 0.5 - 1.0 multiplier. An approved clip keeps at
+        # least half of its CV score, and higher confidence is rewarded on top.
+        frame["final_score"] *= (0.5 + 0.5 * confidence)
 
-    interesting.sort(
+    # Keep only clips the vision model actually approved. We rely on the
+    # binary gameplay / approve flags, which llava sets reliably, rather than
+    # its confidence number, which it does not (it often returns 0.00 for clips
+    # it just approved). Ads, menus and static frames are already rejected via
+    # gameplay = false in the prompt, so no extra confidence floor is needed.
+    approved = [
+        f for f in interesting
+        if f.get("gameplay") and f.get("approve")
+    ]
+
+    approved.sort(
         key=lambda x: x["final_score"],
         reverse=True
     )
 
-    selected = []
-    MIN_DISTANCE = 30
+    # Effective spacing between kept clips. minGap == 0 means "auto" -> one
+    # clip length, so highlights may sit back-to-back. We never allow a gap
+    # smaller than clipLen, otherwise two kept clips would overlap in time.
+    min_gap = inp.minGap if inp.minGap and inp.minGap > 0 else inp.clipLen
+    min_gap = max(min_gap, inp.clipLen)
 
-    for frame in interesting:
+    selected = []
+
+    for frame in approved:
         keep = True
         for chosen in selected:
-            if abs(frame["time"] - chosen["time"]) < MIN_DISTANCE:
+            if abs(frame["time"] - chosen["time"]) < min_gap:
                 keep = False
                 break
         if keep:
             selected.append(frame)
-        if len(selected) == inp.count:
+        if len(selected) == inp.finalCandidates:
             break
+
+    # Fields the n8n flow expects on each candidate.
+    # motion_frames don't carry the original candidate frame path, so use the
+    # cached middle clip frame as a representative thumbnail.
+    for frame in selected:
+        clip_frames = frame.get("clip_frames") or []
+        thumb = clip_frames[2] if len(clip_frames) > 2 else (
+            clip_frames[0] if clip_frames else None
+        )
+        frame["frame_rel"] = (
+            os.path.relpath(thumb, MEDIA) if thumb else None
+        )
+        frame["vision_score"] = frame.get("confidence", 0.0)
 
     print_final_results(selected)
 
@@ -1168,15 +1641,30 @@ def candidates(inp: CandIn):
         reverse=True
     )
 
+    # Same auto / non-overlapping spacing rule as inside process_job, applied
+    # when merging clips from multiple segments of a long video.
+    merge_gap = inp.minGap if inp.minGap and inp.minGap > 0 else inp.clipLen
+    merge_gap = max(merge_gap, inp.clipLen)
+
     final = []
 
     for frame in all_selected:
 
         if all(
-            abs(frame["time"] - f["time"]) >= 30
+            abs(frame["time"] - f["time"]) >= merge_gap
             for f in final
         ):
                 final.append(frame)
+
+    # Optional overall cap across the whole video (all segments combined).
+    # final is already sorted by final_score, so we keep the highest scored.
+    if inp.maxCandidates and inp.maxCandidates > 0:
+        final = final[:inp.maxCandidates]
+
+    # final is already sorted best -> worst by final_score. Stamp an explicit
+    # 1-based rank so the editor / uploader can post them in order.
+    for idx, frame in enumerate(final):
+        frame["rank"] = idx + 1
 
     return {
         "dur": dur,
@@ -1213,20 +1701,25 @@ def render(inp: RenderIn):
 
     for i, clip in enumerate(inp.clips):
 
+        rank = clip.rank if clip.rank else i + 1
+
         out_file = os.path.join(
             out_dir,
-            f"clip_{i+1}.mp4"
+            f"clip_{rank}.mp4"
         )
 
         render_clip(
             source,
             clip.start,
             clip.end,
-            out_file
+            out_file,
+            aspect=inp.aspect,
+            crop_mode=inp.cropMode,
+            fade=inp.fade
         )
 
         rendered.append(
-            f"work/{inp.jobId}/renders/clip_{i+1}.mp4"
+            f"work/{inp.jobId}/renders/clip_{rank}.mp4"
         )
 
     return {

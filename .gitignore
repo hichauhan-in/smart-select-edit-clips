@@ -1,0 +1,25 @@
+# --- Secrets ---
+.env
+
+# --- Runtime data (must NOT be cloned to other machines) ---
+postgres-data/
+n8n-data/
+
+# --- Media working files (keep folders, ignore contents) ---
+media/inbox/*
+media/work/*
+media/output/*
+media/archive/*
+!media/inbox/.gitkeep
+!media/work/.gitkeep
+!media/output/.gitkeep
+!media/archive/.gitkeep
+
+# --- Model weights downloaded at runtime ---
+*.pt
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
