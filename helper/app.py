@@ -221,7 +221,123 @@ def _extract_clip_frames(full, start, end, out_dir):
 
     return frames
 
-def _vision_score_ollama(frame_paths):
+def build_cv_summary(
+    motion,
+    yolo,
+    ocr
+):
+
+    summary = []
+
+    if motion >= 0.80:
+        summary.append("Very high motion detected.")
+    elif motion >= 0.60:
+        summary.append("Moderate motion detected.")
+    elif motion >= 0.30:
+        summary.append("Low motion detected.")
+    else:
+        summary.append("Almost no motion detected.")
+
+    if yolo >= 0.80:
+        summary.append("Many gameplay objects detected.")
+    elif yolo >= 0.60:
+        summary.append("Several gameplay objects detected.")
+    elif yolo >= 0.30:
+        summary.append("Few gameplay objects detected.")
+    else:
+        summary.append("Almost no gameplay objects detected.")
+
+    if ocr >= 0.80:
+        summary.append("Strong reward text detected.")
+    elif ocr >= 0.50:
+        summary.append("Some reward text detected.")
+    elif ocr >= 0.20:
+        summary.append("Very little reward text detected.")
+    else:
+        summary.append("No reward text detected.")
+
+    return summary
+
+def build_prompt(
+    motion,
+    yolo,
+    ocr
+):
+
+    cv_summary = build_cv_summary(
+        motion,
+        yolo,
+        ocr
+    )
+
+    return f"""
+The frames are ordered chronologically.
+
+Frame 1 is the beginning of the clip.
+Frame 5 is the end of the clip.
+
+Judge the progression of the action across all frames instead of treating each image independently.
+
+These are 5 frames taken from the SAME 15-second gameplay clip.
+
+These frames have ALREADY been selected by an automated highlight detection pipeline.
+
+Computer Vision Analysis
+
+Motion Score : {motion:.2f}
+YOLO Score   : {yolo:.2f}
+OCR Score    : {ocr:.2f}
+
+Summary:
+{chr(10).join(cv_summary)}
+
+Interpretation:
+
+• Motion measures how dynamic the scene is.
+• YOLO estimates how many important gameplay objects are visible.
+• OCR detects reward text such as HEADSHOT, KILL, VICTORY, ACE, etc.
+
+Your task is NOT to score this clip from scratch.
+
+Instead:
+
+1. Decide whether these frames show genuine gameplay.
+2. Decide whether this is actually highlight-worthy.
+3. Use the Computer Vision scores as evidence.
+4. If the Computer Vision scores appear misleading, reduce your confidence.
+5. If they agree with what you see, increase your confidence.
+
+Return ONLY valid JSON.
+
+{{
+    "gameplay": true,
+    "approve": true,
+    "confidence": 0.0,
+    "reason": "short reason under 12 words"
+}}
+
+Confidence guide:
+
+1.00 = Exceptional highlight
+0.90 = Excellent gameplay
+0.80 = Strong highlight
+0.70 = Good gameplay
+0.60 = Average gameplay
+0.40 = Weak highlight
+0.20 = Probably not a highlight
+0.00 = Not gameplay or definitely reject
+
+Never return markdown.
+Never explain your answer.
+Return JSON only.
+"""
+
+def _vision_score_ollama(
+    frame_paths,
+    motion,
+    yolo,
+    ocr
+):
     try:
         images = []
 
@@ -230,97 +346,68 @@ def _vision_score_ollama(frame_paths):
                 images.append(
                     base64.b64encode(f.read()).decode()
                 )
-        prompt = """
-        You are reviewing 5 images sampled chronologically from the SAME 15-second video clip.
 
-        Your task is to determine:
-
-        1. Is this clip primarily REAL GAMEPLAY?
-        2. If it is gameplay, how exciting would it be as a YouTube Shorts or TikTok gaming highlight?
-
-        GAMEPLAY includes:
-        - player controlling a character
-        - combat
-        - enemies
-        - weapons
-        - boss fights
-        - racing
-        - platforming
-        - exploration
-
-        NOT GAMEPLAY includes:
-        - advertisements
-        - sponsor messages
-        - promotional videos
-        - game trailers
-        - cinematic cutscenes
-        - loading screens
-        - menus
-        - inventory screens
-        - settings screens
-        - static logos
-        - title screens
-        - streamer webcam only
-        - intermission screens
-        - overlays without actual gameplay
-
-        The 5 images represent the SAME clip.
-        Judge the ENTIRE clip, not an individual image.
-
-        When scoring gameplay, prioritize clips that contain:
-        - firefights
-        - kills or eliminations
-        - bosses
-        - explosions
-        - intense movement
-        - close calls
-        - clutch moments
-        - visually exciting action
-
-        Avoid giving high scores to:
-        - walking
-        - looting
-        - waiting
-        - idle gameplay
-        - menus
-        - advertisements
-        - static scenes
+        cv_summary = build_cv_summary(motion, yolo, ocr)
         
-        Assume the goal is to maximize viewer retention on YouTube Shorts and TikTok. Prefer clips that would make a viewer stop scrolling and continue watching.
+        prompt = f"""
+        The frames are ordered chronologically.
 
-        Scoring:
+        Frame 1 is the beginning of the clip.
+        Frame 5 is the end of the clip.
 
-        10 = Incredible highlight, instantly shareable
-        9 = Outstanding action
-        8 = Intense combat
-        7 = Good action
-        6 = Decent gameplay
-        5 = Average gameplay
-        4 = Mostly slow gameplay
-        3 = Very little action
-        2 = Barely gameplay
-        1 = Idle or uninteresting gameplay
+        Judge the progression of the action across all frames instead of treating each image independently.
+        These are 5 frames taken from the SAME 15-second gameplay clip.
 
-        If the clip is NOT gameplay:
+        These frames have ALREADY been selected by an automated highlight detection pipeline.
 
-        {
-            "gameplay": false,
-            "score": 0,
-            "reason": "short reason"
-        }
+        Computer Vision Analysis
 
-        If the clip IS gameplay:
+        Motion Score : {motion:.2f}
+        YOLO Score   : {yolo:.2f}
+        OCR Score    : {ocr:.2f}
 
-        {
-            "gameplay": true,
-            "score": <integer 1-10>,
-            "reason": "<maximum 8 words>"
-        }
+        Summary:
+        {chr(10).join(cv_summary)}
+
+        Interpretation:
+
+        • Motion measures how dynamic the scene is.
+        • YOLO estimates how many important gameplay objects are visible.
+        • OCR detects reward text such as HEADSHOT, KILL, VICTORY, ACE, etc.
+
+        Your task is NOT to score this clip from scratch.
+
+        Instead:
+
+        1. Decide whether these frames show genuine gameplay.
+        2. Decide whether this is actually highlight-worthy.
+        3. Use the Computer Vision scores as evidence.
+        4. If the Computer Vision scores appear misleading, reduce your confidence.
+        5. If they agree with what you see, increase your confidence.
 
         Return ONLY valid JSON.
-        Do not include markdown.
-        Do not include explanations.
-        Do not output any text outside the JSON.
+
+        {{
+            "gameplay": true,
+            "approve": true,
+            "confidence": 0.0,
+            "reason": "short reason under 12 words"
+        }}
+
+        Confidence guide:
+
+        1.00 = Exceptional highlight
+        0.90 = Excellent gameplay
+        0.80 = Strong highlight
+        0.70 = Good gameplay
+        0.60 = Average gameplay
+        0.40 = Weak highlight
+        0.20 = Probably not a highlight
+        0.00 = Not gameplay or definitely reject
+
+        Never return markdown.
+        Never explain your answer.
+        Return JSON only.
         """
 
         #r = requests.post(f"{OLLAMA}/api/generate", json={
@@ -352,36 +439,28 @@ def _vision_score_ollama(frame_paths):
 
         data = json.loads(resp.get("response", "{}"))
 
-        gameplay = str(
-            data.get("gameplay", True)
-        ).lower() == "true"
-        score = float(data.get("score", 0))
-        reason = str(data.get("reason", ""))
-        return gameplay, score, reason
+        gameplay = bool(data.get("gameplay", True))
+
+        approve = bool(data.get("approve", True))
+
+        confidence = float(
+            data.get("confidence", 0.5)
+        )
+
+        reason = str(
+            data.get("reason", "")
+        )
+
+        return gameplay, approve, confidence, reason
     except Exception as e:
-        return True, 0, f"score-failed:{e}"
+        return True, True, 0.5, f"score-failed:{e}"
 
-
-def _vision_score(frame_paths):
-
-    print("\n" + "=" * 70, flush=True)
-    print("VISION INFERENCE", flush=True)
-    print(f"Backend : {VISION_BACKEND}", flush=True)
-    print(f"Model   : {VISION_MODEL}", flush=True)
-    print(f"Images  : {len(frame_paths)}", flush=True)
-    print("=" * 70, flush=True)
-
-    if VISION_BACKEND == "ollama":
-        return _vision_score_ollama(frame_paths)
-
-    elif VISION_BACKEND == "lmstudio":
-        return _vision_score_lmstudio(frame_paths)
-
-    raise ValueError(
-        f"Unknown vision backend: {VISION_BACKEND}"
-    )
-
-def _vision_score_lmstudio(frame_paths):
+def _vision_score_lmstudio(
+    frame_paths,
+    motion,
+    yolo,
+    ocr
+):
 
     try:
 
@@ -400,91 +479,68 @@ def _vision_score_lmstudio(frame_paths):
                 }
             })
 
-        prompt = """
-        You are reviewing 5 images sampled chronologically from the SAME 15-second video clip.
 
-        Your task is to determine:
+        cv_summary = build_cv_summary(motion, yolo, ocr)
 
-        1. Is this clip primarily REAL GAMEPLAY?
-        2. If it is gameplay, how exciting would it be as a YouTube Shorts or TikTok gaming highlight?
+        prompt = f"""
+        The frames are ordered chronologically.
 
-        GAMEPLAY includes:
-        - player controlling a character
-        - combat
-        - weapons
-        - platforming
-        - exploration
+        Frame 1 is the beginning of the clip.
+        Frame 5 is the end of the clip.
 
-        NOT GAMEPLAY includes:
-        - advertisements
-        - sponsor messages
-        - promotional videos
-        - game trailers
-        - loading screens
-        - menus
-        - inventory screens
-        - settings screens
-        - title screens
-        - streamer webcam only
-        - intermission screens
-        - overlays without actual gameplay
+        Judge the progression of the action across all frames instead of treating each image independently.
+        These are 5 frames taken from the SAME 15-second gameplay clip.
 
-        The 5 images represent the SAME clip.
-        Judge the ENTIRE clip, not an individual image.
+        These frames have ALREADY been selected by an automated highlight detection pipeline.
 
-        When scoring gameplay, prioritize clips that contain:
-        - firefights
-        - kills or eliminations
-        - explosions
-        - intense movement
-        - close calls
-        - clutch moments
-        - visually exciting action
+        Computer Vision Analysis
 
-        Avoid giving high scores to:
-        - walking
-        - looting
-        - waiting
-        - idle gameplay
-        - menus
-        - advertisements
-        - static scenes
-        
-        Assume the goal is to maximize viewer retention on YouTube Shorts and TikTok. Prefer clips that would make a viewer stop scrolling and continue watching.
+        Motion Score : {motion:.2f}
+        YOLO Score   : {yolo:.2f}
+        OCR Score    : {ocr:.2f}
 
-        Scoring:
+        Summary:
+        {chr(10).join(cv_summary)}
 
-        10 = Incredible highlight, instantly shareable
-        9 = Outstanding action
-        8 = Intense combat
-        7 = Good action
-        6 = Decent gameplay
-        5 = Average gameplay
-        4 = Mostly slow gameplay
-        3 = Very little action
-        2 = Barely gameplay
-        1 = Idle or uninteresting gameplay
+        Interpretation:
 
-        If the clip is NOT gameplay:
+        • Motion measures how dynamic the scene is.
+        • YOLO estimates how many important gameplay objects are visible.
+        • OCR detects reward text such as HEADSHOT, KILL, VICTORY, ACE, etc.
 
-        {
-            "gameplay": false,
-            "score": 0,
-            "reason": "short reason"
-        }
+        Your task is NOT to score this clip from scratch.
 
-        If the clip IS gameplay:
+        Instead:
 
-        {
-            "gameplay": true,
-            "score": <integer 1-10>,
-            "reason": "<maximum 8 words>"
-        }
+        1. Decide whether these frames show genuine gameplay.
+        2. Decide whether this is actually highlight-worthy.
+        3. Use the Computer Vision scores as evidence.
+        4. If the Computer Vision scores appear misleading, reduce your confidence.
+        5. If they agree with what you see, increase your confidence.
 
         Return ONLY valid JSON.
-        Do not include markdown.
-        Do not include explanations.
-        Do not output any text outside the JSON.
+
+        {{
+            "gameplay": true,
+            "approve": true,
+            "confidence": 0.0,
+            "reason": "short reason under 12 words"
+        }}
+
+        Confidence guide:
+
+        1.00 = Exceptional highlight
+        0.90 = Excellent gameplay
+        0.80 = Strong highlight
+        0.70 = Good gameplay
+        0.60 = Average gameplay
+        0.40 = Weak highlight
+        0.20 = Probably not a highlight
+        0.00 = Not gameplay or definitely reject
+
+        Never return markdown.
+        Never explain your answer.
+        Return JSON only.
         """
 
         content = [
@@ -531,24 +587,55 @@ def _vision_score_lmstudio(frame_paths):
 
         data = json.loads(answer)
 
-        gameplay = str(
-            data.get("gameplay", True)
-        ).lower() == "true"
+        gameplay = bool(data.get("gameplay", True))
 
-        score = float(
-            data.get("score", 0)
+        approve = bool(data.get("approve", True))
+
+        confidence = float(
+            data.get("confidence", 0.5)
         )
 
-        reason = data.get(
-            "reason",
-            ""
-        )
+        reason = data.get("reason", "")
 
-        return gameplay, score, reason
+        return gameplay, approve, confidence, reason
 
     except Exception as e:
 
-        return True, 0, f"lmstudio-failed:{e}"
+        return True, True, 0.5, f"lmstudio-failed:{e}"
+
+def _vision_score(
+    frame_paths,
+    motion,
+    yolo,
+    ocr
+):
+
+    print("\n" + "=" * 70, flush=True)
+    print("VISION INFERENCE", flush=True)
+    print(f"Backend : {VISION_BACKEND}", flush=True)
+    print(f"Model   : {VISION_MODEL}", flush=True)
+    print(f"Images  : {len(frame_paths)}", flush=True)
+    print("=" * 70, flush=True)
+
+    if VISION_BACKEND == "ollama":
+        return _vision_score_ollama(
+            frame_paths,
+            motion,
+            yolo,
+            ocr
+        )
+
+    elif VISION_BACKEND == "lmstudio":
+        return _vision_score_lmstudio(
+            frame_paths,
+            motion,
+            yolo,
+            ocr
+        )
+
+    raise ValueError(
+        f"Unknown vision backend: {VISION_BACKEND}"
+    )
 
 class CandIn(BaseModel):
     path: str
@@ -884,7 +971,6 @@ def candidates(inp: CandIn):
             f"Text={frame['ocr_text'][:80]}",
             flush=True
         )
-        frame["vision_score"] = 0
         frame["reason"] = ""
 
         scored.append(frame)
@@ -996,24 +1082,26 @@ def candidates(inp: CandIn):
             clip_dir
         )
 
-        gameplay, score, reason = _vision_score(clip_frames)
+        gameplay, approve, confidence, reason = _vision_score(
+            clip_frames,
+            frame["motion_norm"],
+            frame["yolo_norm"],
+            frame["ocr_norm"]
+        )
 
         frame["gameplay"] = gameplay
-        frame["vision_score"] = score
+        frame["approve"] = approve
+        frame["confidence"] = confidence
         frame["reason"] = reason
-
-        if not gameplay:
-            frame["final_score"] = -9999
-
+        if not gameplay or not approve:
             print(
-                "Rejected:",
-                reason,
+                f"Rejected by Vision: {reason}",
                 flush=True
             )
             continue
 
         # Add LLaVA's opinion to the existing fast score
-        frame["final_score"] += frame["vision_score"] * 2
+        frame["final_score"] *= confidence
 
     interesting.sort(
         key=lambda x: x["final_score"],
@@ -1040,12 +1128,13 @@ def candidates(inp: CandIn):
         print(
             f"{i}. "
             f"Time={frame['time']:.1f}s | "
-            f"Gameplay={frame['gameplay']} | "
-            f"Final={frame['final_score']:.2f} | "
-            f"Vision={frame['vision_score']} | "
             f"Motion={frame['motion_norm']:.2f} | "
-            f"YOLO={frame['yolo']:.2f} | "
-            f"OCR={frame['ocr']} | "
+            f"YOLO={frame['yolo_norm']:.2f} | "
+            f"OCR={frame['ocr_norm']:.2f} | "
+            f"Gameplay={frame['gameplay']} "
+            f"Approve={frame['approve']} "
+            f"Confidence={frame['confidence']:.2f} "
+            f"Final={frame['final_score']:.2f} "
             f"Reason={frame['reason']}",
             flush=True
 )
