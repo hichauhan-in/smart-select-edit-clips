@@ -71,13 +71,13 @@ Make clips look like *yours* and readable on mute.
 Make the crop and motion feel hand-edited.
 
 ### Cropping & Layout
-- [ ] Smart Subject Tracking (follow the player / crosshair)
-- [ ] Auto Zoom on Action (punch in on the kill / peak motion)
-- [ ] HUD-safe Cropping (never cut off health/ammo/score)
-- [ ] Dynamic Crop (move the crop window over time)
+- [x] Smart Subject Tracking (follow the player / crosshair) - YOLO pan over time
+- [ ] Auto Zoom on Action (punch in on the kill / peak motion) - needs zoompan, deferred (crop size can't vary)
+- [~] HUD-safe Cropping - `hud_safe` clamps pan to centre; no HUD detection yet
+- [x] Dynamic Crop (move the crop window over time) - smart cropMode
 
 ### Visual Effects (helper ffmpeg, simple ones first)
-- [ ] Speed Ramp / Slow Motion on the peak moment
+- [x] Speed Ramp / Slow Motion on the peak moment - /edit slowmo (cropped variant)
 - [ ] Freeze Frame / Replay Effect
 - [ ] Cinematic Bars / Vignette / Color Grading (LUT)
 - [ ] Screen Shake / Flash / Hit Marker on impact (driven by audio peak time)

@@ -218,26 +218,43 @@ TWO vertical variants. Add this node AFTER Render, BEFORE Cleanup.
 {
     "jobId": "{{ $('Job Info').item.json.jobId }}",
     "aspect": "9:16",
-    "fade": 0.5
+    "fade": 0.5,
+    "fadeOut": 1.0,
+    "headroom": 0.42,
+    "cardAspect": "1:1",
+    "radius": 48,
+    "borderWidth": 5
 }
 ```
 
 Method: POST · URL: `http://helper:8000/edit`.
 
 Processes all clips in `renders/` (flat + every `segment_*`). For each it makes
-a smart-cropped (player-tracked) and a blurred-background version, mirroring the
+two variants of the SAME rounded 1:1 cutout (full width, pushed down so the
+empty space splits 60% above / 40% below): a **card** version on a solid black
+background with a thin white border ring, and a **blurred** version where that
+same cutout sits over a blurred zoom of the clip (no border). Mirrors the
 renders layout:
 
 ```
-work/<jobId>/edited/cropped/clip_1.mp4   blurred/clip_1.mp4
-                    cropped/segment_2/clip_3.mp4  ...
+work/<jobId>/edited/card/clip_1.mp4   blurred/clip_1.mp4
+                    card/segment_2/clip_3.mp4  ...
 ```
 
-Response: `{ "cropped": [...], "blurred": [...] }`.
+Response: `{ "card": [...], "blurred": [...] }`.
 
 - `aspect` -> `9:16` | `4:5` | `1:1` | `16:9` | `source`
-- `fade`   -> fade in/out seconds
-- crop = smart YOLO pan (player tracked) · blur = full frame, no bars/HUD loss
+- `fade`    -> intro fade-IN seconds from black (0.5 = quick, snappy open)
+- `fadeOut` -> outro fade-OUT seconds to black (1.0 = slower, softer ending).
+               Both only apply when the clip is longer than fade + fadeOut.
+- `cardAspect` -> crop aspect of the cutout (`1:1` default = tall square card,
+                  centre-cropped so the left/right is trimmed and the action
+                  zooms in; `4:3` for a shorter/wider card)
+- `radius` -> corner radius in px (48 default; 0 = square corners)
+- `borderWidth` -> black card only: white border-ring thickness in px (5 = thin,
+                   0 = no border)
+- **card** = 1:1 rounded cutout on solid black, thin white border, 60/40 bars
+- **blurred** = the same 1:1 rounded cutout over a blurred zoom of the clip
 
 > `jobId` must come from **Job Info** - Render's output only has `clips`.
 

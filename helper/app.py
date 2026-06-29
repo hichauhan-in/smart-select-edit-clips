@@ -349,6 +349,81 @@ def subject_center_x(frames):
                 xs.append(xc)
     return sum(xs) / len(xs) if xs else 0.5
 
+
+def track_subject_x(video_path, dur, job_dir, step=1.0):
+    """Sample the player's horizontal centre once per `step` seconds and return
+    a list of (time, cx) used to pan the crop window dynamically. Empty frames
+    fall back to the previous point so the window holds instead of jumping."""
+    work = os.path.join(job_dir, f".track_{int(time.time()*1000)}")
+    os.makedirs(work, exist_ok=True)
+    n = max(2, int(dur / step))
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", video_path, "-vf", f"fps=1/{step}",
+         "-q:v", "5", os.path.join(work, "t_%04d.jpg")],
+        capture_output=True
+    )
+    frames = sorted(glob.glob(os.path.join(work, "t_*.jpg")))
+    pts, last = [], 0.5
+    for i, fp in enumerate(frames):
+        cx = subject_center_x([fp])
+        if cx == 0.5:
+            cx = last
+        # FPS kills land on the centre crosshair while the player sits off to
+        # one side, so only lean ~40% toward the player and keep the centre.
+        cx = 0.5 + (cx - 0.5) * 0.4
+        last = cx
+        pts.append((round(i * step, 2), round(cx, 3)))
+    shutil.rmtree(work, ignore_errors=True)
+    # Smooth so the pan glides rather than snaps.
+    sm = []
+    for i, (t, c) in enumerate(pts):
+        lo = max(0, i - 1)
+        hi = min(len(pts), i + 2)
+        sm.append((t, sum(p[1] for p in pts[lo:hi]) / (hi - lo)))
+    return sm or [(0.0, 0.5)]
+
+
+def pan_x_expr(points):
+    """Build a piecewise-linear ffmpeg x expression (fraction 0..1) over time
+    from tracked (time, cx) points, clamped 0.30..0.70 to keep the centre
+    crosshair/action in frame even when leaning toward the player."""
+    pts = [(t, min(0.70, max(0.30, c))) for t, c in points]
+    expr = f"{pts[-1][1]:.3f}"
+    for i in range(len(pts) - 2, -1, -1):
+        t0, c0 = pts[i]
+        t1, c1 = pts[i + 1]
+        slope = (c1 - c0) / (t1 - t0) if t1 > t0 else 0.0
+        expr = f"if(lt(t,{t1:.2f}),{c0:.3f}+({slope:.5f})*(t-{t0:.2f}),{expr})"
+    return expr
+
+
+def find_motion_peak(video_path, dur, job_dir, step=0.5):
+    """Return the time of HIGHEST motion in a clip - the moment to punch in on
+    for an auto-zoom. Returns dur/2 when motion can't be sampled."""
+    work = os.path.join(job_dir, f".peak_{int(time.time()*1000)}")
+    os.makedirs(work, exist_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", video_path, "-vf", f"fps={1.0/step}",
+         "-q:v", "5", os.path.join(work, "p_%04d.jpg")],
+        capture_output=True
+    )
+    frames = sorted(glob.glob(os.path.join(work, "p_*.jpg")))
+    best_t, best_m, prev = dur / 2.0, -1.0, None
+    for i, img in enumerate(frames):
+        if prev is not None:
+            m = motion_score(prev, img)
+            if m > best_m:
+                best_m, best_t = m, i * step
+        prev = img
+    shutil.rmtree(work, ignore_errors=True)
+    return best_t
+
+
+def zoom_expr(peak_t, amp=0.18, sigma=2.0):
+    """Crop-size multiplier over time: 1.0 normally, shrinking (punch-in) to
+    1-amp around peak_t with a smooth gaussian, so motion drives a subtle zoom."""
+    return f"(1-{amp}*exp(-((t-{peak_t:.2f})/{sigma})^2))"
+
 def _extract_clip_frames(full, start, end, out_dir):
 
     os.makedirs(out_dir, exist_ok=True)
@@ -852,7 +927,7 @@ class CandIn(BaseModel):
     clipMax: float = 0.0
     sampleInterval: float = 2.0
     topMotion: int = 20
-    finalCandidates: int = 4
+    finalCandidates: int = 3
     # OCR + vision are the slow stages. We refine all topMotion candidates
     # (cheap motion math) but only run OCR/vision on the strongest ones.
     # 0 == auto: half of the refined candidates (never below finalCandidates).
@@ -1086,7 +1161,70 @@ def find_motion_lull(video_path, lo, hi, job_dir, step=0.5):
     return best_t
 
 
-def choose_clip_bounds(peak, scene_cuts, dur, clip_min, clip_max,
+def cut_ends_scene(video_path, cut_t, dur, job_dir, gap=0.6, step=0.4):
+    """Tell a real scene change from an in-action flash / explosion.
+
+    ``motion_score`` is the mean absolute luma difference between two frames
+    (0-255). At a genuine hard cut the picture a moment BEFORE the cut and a
+    moment AFTER it are unrelated, so their difference is far larger than the
+    scene's own frame-to-frame motion. An explosion or muzzle flash spikes the
+    scene_score for a single frame but the SAME scene continues on both sides,
+    so the before/after pictures stay similar.
+
+    We compare the frame ~``gap``s before the cut to the frame ~``gap``s after
+    it (skipping the bright flash frame itself) against the in-scene motion
+    baseline just before the cut. Returns True only when the two sides differ
+    clearly more than normal in-scene motion -> a cut that truly ENDS the
+    action. Returns True when it can't sample (no video / too near an edge) so
+    the scene_score decision stands.
+    """
+    if not video_path or cut_t <= gap:
+        return True
+    lo = max(0.0, cut_t - gap - 2 * step)
+    hi = min(dur, cut_t + gap + step)
+    if hi - lo < 3 * step:
+        return True
+    work = os.path.join(job_dir, "refine", f"cut_{int(cut_t * 1000)}")
+    os.makedirs(work, exist_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-y", "-ss", str(lo), "-i", video_path, "-t", str(hi - lo),
+         "-vf", f"fps={1.0/step}", "-q:v", "5", os.path.join(work, "c_%04d.jpg")],
+        capture_output=True
+    )
+    frames = sorted(glob.glob(os.path.join(work, "c_*.jpg")))
+    if len(frames) < 4:
+        shutil.rmtree(work, ignore_errors=True)
+        return True
+    times = [lo + i * step for i in range(len(frames))]
+
+    def nearest(target):
+        return min(range(len(times)), key=lambda i: abs(times[i] - target))
+
+    bi = nearest(cut_t - gap)
+    ai = nearest(cut_t + gap)
+    across = motion_score(frames[bi], frames[ai]) if bi != ai else 0.0
+
+    # In-scene baseline: consecutive motion among frames strictly before the cut.
+    base = [
+        motion_score(frames[i - 1], frames[i])
+        for i in range(1, len(frames))
+        if times[i] <= cut_t - step
+    ]
+    shutil.rmtree(work, ignore_errors=True)
+    baseline = (sum(base) / len(base)) if base else 0.0
+
+    # Real cut: the two sides differ much more than normal in-scene motion, and
+    # by a meaningful absolute amount so a low-motion scene can't trip on noise.
+    settled = across >= max(12.0, baseline * 1.6)
+    print(
+        f"  cut@{cut_t:.2f}s across={across:.1f} baseline={baseline:.1f} "
+        f"-> {'scene-end' if settled else 'flash/keep-going'}",
+        flush=True
+    )
+    return settled
+
+
+def choose_clip_bounds(peak, scene_pairs, dur, clip_min, clip_max,
                        video_path=None, job_dir=None):
     """
     Pick a natural ``[start, end]`` for one highlight.
@@ -1095,6 +1233,14 @@ def choose_clip_bounds(peak, scene_cuts, dur, clip_min, clip_max,
     stopwatch length, the start and end are snapped to nearby scene cuts so the
     clip BEGINS and ENDS on a real visual change (a new room, the kill cam
     ending, etc). The peak (busiest) moment always stays inside the window.
+
+    ``scene_pairs`` is a list of ``(time, scene_score)`` so the END can be
+    chosen by how STRONG the cut is, not merely by how close its length is to
+    the target. We end on the FIRST genuinely strong cut after the peak (the
+    action's real scene change) and stop a hair before it, because the detected
+    timestamp is the first frame of the NEXT scene and we don't want to bleed it
+    into the clip. This stops the recurring problem of clips that run a few
+    seconds past (or short of) where the scene actually changed.
 
     When ``clip_min`` and ``clip_max`` are (almost) equal we keep the old
     behaviour: a fixed-length clip centred on the peak.
@@ -1111,7 +1257,23 @@ def choose_clip_bounds(peak, scene_cuts, dur, clip_min, clip_max,
             start = max(0.0, end - target)
         return round(start, 2), round(end, 2)
 
-    cuts = sorted(scene_cuts)
+    # Accept either (time, score) pairs or a bare list of times (back-compat).
+    pairs = []
+    for p in scene_pairs:
+        if isinstance(p, (tuple, list)):
+            pairs.append((float(p[0]), float(p[1])))
+        else:
+            pairs.append((float(p), 0.0))
+    pairs.sort()
+    cuts = [t for t, _ in pairs]
+    score_of = {round(t, 2): s for t, s in pairs}
+
+    # The cut timestamp is the first frame of the NEXT scene, so end the clip a
+    # touch earlier to avoid showing a sliver of the new scene.
+    LEAD = 0.12
+    # scene_score that counts as a real hard cut rather than in-scene flicker.
+    # Detection runs at base threshold 0.12, so 0.20 keeps the stronger cuts.
+    STRONG = 0.20
 
     # START: the latest scene cut shortly before the peak (the action's start).
     # Must leave >= 0.5s of lead-in and sit no further back than clip_max.
@@ -1122,27 +1284,49 @@ def choose_clip_bounds(peak, scene_cuts, dur, clip_min, clip_max,
     if start is None:
         start = peak - target / 2.0
 
-    # END: snap to the scene cut whose length is closest to the target, so the
-    # clip ends on a real visual change rather than a stopwatch. Only cuts that
-    # land after the peak and keep length within [clip_min, clip_max] qualify;
-    # among those pick the one nearest the ideal target length.
-    valid_ends = [
-        e for e in cuts
+    # END: end on a real scene change after the peak. Among cuts that keep the
+    # length within [clip_min, clip_max], take the EARLIEST genuinely strong cut
+    # that a motion-continuity check confirms actually ENDS the action (the
+    # picture settles across it). This skips in-action explosions / flashes that
+    # spike scene_score but keep the same scene going. If no strong cut is a
+    # real boundary, end where the action subsides (motion lull); then fall back
+    # to the strongest cut, then to the target length.
+    in_range = [
+        (e, score_of.get(round(e, 2), 0.0))
+        for e in cuts
         if e > peak and clip_min <= (e - start) <= clip_max
     ]
-    if valid_ends:
-        end = min(valid_ends, key=lambda e: abs((e - start) - target))
-    else:
-        # No scene cut in range: end at the calmest moment between clip_min and
-        # clip_max so a continuous scene stops where action drops, not on a
-        # fixed timer. Falls back to target if motion can't be sampled.
+    strong = sorted(
+        ((e, sc) for e, sc in in_range if sc >= STRONG),
+        key=lambda es: es[0],
+    )
+
+    end = None
+    ended_on_cut = False
+    for e, _sc in strong[:4]:
+        if cut_ends_scene(video_path, e, dur, job_dir):
+            end, ended_on_cut = e, True
+            break
+
+    if end is None:
         lull = find_motion_lull(
             video_path,
             min(dur, start + clip_min),
             min(dur, start + clip_max),
             job_dir,
         )
-        end = lull if lull else start + target
+        if lull:
+            end = lull
+        elif strong:
+            end, ended_on_cut = max(strong, key=lambda es: es[1])[0], True
+        elif in_range:
+            end, ended_on_cut = max(in_range, key=lambda es: es[1])[0], True
+        else:
+            end = start + target
+    # Stop just before the detected cut so the next scene doesn't leak in (only
+    # when we actually snapped to a cut, not to a motion lull / target).
+    if ended_on_cut:
+        end -= LEAD
 
     # Enforce the length range.
     length = end - start
@@ -1177,10 +1361,16 @@ ASPECT_DIMS = {
 }
 
 
-def build_video_filter(aspect, crop_mode, fade_dur, duration, cx=0.5):
+def build_video_filter(aspect, crop_mode, fade_dur, duration, cx=0.5,
+                       cx_expr=None, zoom=None, hud_safe=False, headroom=0.42,
+                       card_aspect="1:1", radius=48, fade_out=None, border=5):
     """
     Build the ffmpeg filter for reframing a clip to ``aspect`` with the chosen
     ``crop_mode`` plus optional fade in/out.
+
+    ``fade_dur`` is the intro fade-IN length; ``fade_out`` is the outro
+    fade-OUT length (defaults to ``fade_dur`` when not given, so a single value
+    still gives a symmetric fade).
 
     Returns ``(flag, filter_string, extra_maps)`` where ``flag`` is either
     ``"-vf"`` (single chain) or ``"-filter_complex"`` (blur needs a split), and
@@ -1188,13 +1378,19 @@ def build_video_filter(aspect, crop_mode, fade_dur, duration, cx=0.5):
     """
     dims = ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"])
 
+    fin = fade_dur if fade_dur and fade_dur > 0 else 0.0
+    fout = fade_out if fade_out is not None else fin
+    fout = fout if fout and fout > 0 else 0.0
     fades = ""
-    if fade_dur and fade_dur > 0 and duration > 2 * fade_dur:
-        out_start = max(0.0, duration - fade_dur)
-        fades = (
-            f",fade=t=in:st=0:d={fade_dur}"
-            f",fade=t=out:st={out_start:.3f}:d={fade_dur}"
-        )
+    # Only fade when the clip is long enough to hold both an intro and outro.
+    if (fin > 0 or fout > 0) and duration > (fin + fout):
+        out_start = max(0.0, duration - fout)
+        parts = []
+        if fin > 0:
+            parts.append(f",fade=t=in:st=0:d={fin}")
+        if fout > 0:
+            parts.append(f",fade=t=out:st={out_start:.3f}:d={fout}")
+        fades = "".join(parts)
 
     # Keep the original frame size, just (optionally) fade.
     if dims is None:
@@ -1215,6 +1411,96 @@ def build_video_filter(aspect, crop_mode, fade_dur, duration, cx=0.5):
         )
         return "-filter_complex", fc, ["-map", "[v]", "-map", "0:a?"]
 
+    if crop_mode == "template":
+        # The whole gameplay frame (NO cropping) sits as a band over a blurred
+        # copy of itself, leaving deliberate empty room above and below for a
+        # title / logo / handles. The video is full-width (as big as possible
+        # without cutting). ``headroom`` 0..1 = how much of the leftover space
+        # goes ABOVE the video (0.42 = slightly high, more room at the bottom
+        # for captions).
+        head = min(0.9, max(0.1, headroom))
+        fc = (
+            f"[0:v]split=2[bg][fg];"
+            f"[bg]scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H},gblur=sigma=25[bg2];"
+            f"[fg]scale={W}:-2[fg2];"
+            f"[bg2][fg2]overlay=(W-w)/2:(H-h)*{head:.3f}"
+            f"{fades}[v]"
+        )
+        return "-filter_complex", fc, ["-map", "[v]", "-map", "0:a?"]
+
+    if crop_mode in ("card", "card_blur"):
+        # Screenshot-style card: crop the gameplay to a taller (default 1:1)
+        # window, round the corners and place it full-width, pushed down so the
+        # empty space splits 60% above / 40% below. The background is either a
+        # solid BLACK canvas ("card") or a BLURRED zoom of the frame itself
+        # ("card_blur"). The black card also gets a thin white border ring
+        # tracing the rounded cutout.
+        try:
+            caw, cah = (float(x) for x in card_aspect.split(":"))
+            car = caw / cah
+        except Exception:
+            car = 1.0
+        Wc = W
+        Hc = int(round(Wc / car))
+        Hc -= Hc % 2
+        r = max(0, int(radius))
+
+        def _round_alpha(rad):
+            # Opaque everywhere except outside the four corner quarter-circles
+            # of a rounded rectangle the size of the layer being filtered.
+            rad = max(0, int(rad))
+            return (
+                f"if(gt(abs(X-(W-1)/2),(W-1)/2-{rad})*gt(abs(Y-(H-1)/2),(H-1)/2-{rad}),"
+                f"if(lte(hypot(abs(X-(W-1)/2)-((W-1)/2-{rad}),abs(Y-(H-1)/2)-((H-1)/2-{rad})),{rad}),255,0),255)"
+            )
+
+        # Card placement (top-left of the cutout): full width, 60/40 vertically.
+        vx = (W - Wc) // 2
+        oy = int(round((H - Hc) * 0.6))
+        dur_s = f"{max(0.1, duration):.3f}"
+
+        crop_scale = (
+            f"crop='min(iw,ih*{car:.5f})':'min(ih,iw/{car:.5f})',scale={Wc}:{Hc}"
+        )
+        fg = (
+            f"{crop_scale},format=yuva420p,"
+            f"geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='{_round_alpha(r)}'[fg]"
+        )
+
+        if crop_mode == "card_blur":
+            # Blurred zoom of the same clip behind the rounded cutout (no border).
+            fc = (
+                f"[0:v]split=2[src][bgsrc];"
+                f"[bgsrc]scale={W}:{H}:force_original_aspect_ratio=increase,"
+                f"crop={W}:{H},gblur=sigma=25[bg];"
+                f"[src]{fg};"
+                f"[bg][fg]overlay={vx}:{oy}{fades}[v]"
+            )
+            return "-filter_complex", fc, ["-map", "[v]", "-map", "0:a?"]
+
+        # Black card, optionally with a thin white border ring. The border is a
+        # white rounded card (radius r+b) sitting b px larger behind the cutout,
+        # so a uniform b-px ring of white shows around the rounded video.
+        b = max(0, int(border))
+        if b > 0:
+            Wbc, Hbc = Wc + 2 * b, Hc + 2 * b
+            fc = (
+                f"[0:v]{fg};"
+                f"color=c=black:s={W}x{H}:d={dur_s}[bg];"
+                f"color=c=white:s={Wbc}x{Hbc}:d={dur_s},format=yuva420p,"
+                f"geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='{_round_alpha(r + b)}'[bd];"
+                f"[bg][bd]overlay={vx - b}:{oy - b}[bg2];"
+                f"[bg2][fg]overlay={vx}:{oy}{fades}[v]"
+            )
+        else:
+            fc = (
+                f"[0:v]{fg};"
+                f"color=c=black:s={W}x{H}:d={dur_s}[bg];"
+                f"[bg][fg]overlay={vx}:{oy}{fades}[v]"
+            )
+        return "-filter_complex", fc, ["-map", "[v]", "-map", "0:a?"]
+
     if crop_mode == "fit":
         chain = (
             f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
@@ -1224,15 +1510,21 @@ def build_video_filter(aspect, crop_mode, fade_dur, duration, cx=0.5):
         return "-vf", chain, []
 
     # Default "center": crop the centre strip to the target aspect, then scale.
-    # "smart": same crop width but panned toward the subject (cx 0..1) so the
-    # player isn't cut off; cx=0.5 is identical to center.
+    # "smart": same crop width but panned toward the subject. A time-based
+    # cx_expr makes the pan follow the player frame-by-frame; a constant cx is
+    # a single static offset. zoom (multiplier expr) punches in on the action.
+    # hud_safe keeps the pan near centre so edge HUD isn't lost. cx=0.5 + no
+    # zoom is identical to center.
     cx = min(0.85, max(0.15, cx))
-    chain = (
-        f"crop='min(iw,ih*{W}/{H})':'min(ih,iw*{H}/{W})':"
-        f"'(iw-min(iw,ih*{W}/{H}))*{cx:.3f}':0,"
-        f"scale={W}:{H}"
-        f"{fades}"
-    )
+    pan_lo, pan_hi = (0.35, 0.65) if hud_safe else (0.15, 0.85)
+    cw = f"min(iw,ih*{W}/{H})"
+    ch = f"min(ih,iw*{H}/{W})"
+    frac = cx_expr if cx_expr else f"{cx:.3f}"
+    frac = f"clip({frac},{pan_lo},{pan_hi})"
+    x = f"(iw-({cw}))*({frac})"
+    y = f"(ih-({ch}))/2"
+    chain = f"crop='{cw}':'{ch}':'{x}':'{y}',scale={W}:{H}"
+    chain += fades
     return "-vf", chain, []
 
 
@@ -1497,8 +1789,11 @@ def process_job(
     scene_pairs = detect_scenes(full)
 
     # Every detected cut (at the low base threshold) is a potential clip
-    # boundary; variable-length clips are later snapped to these.
-    boundary_cuts = sorted(t for (t, _s) in scene_pairs)
+    # boundary; variable-length clips are later snapped to these. We keep the
+    # (time, scene_score) pairs too so the bounds picker can prefer STRONG cuts
+    # (real scene changes) over weak flicker when ending a clip.
+    boundary_pairs = sorted(scene_pairs)
+    boundary_cuts = [t for (t, _s) in boundary_pairs]
 
     scene_threshold = 0.30
     scene_times = []
@@ -1640,7 +1935,7 @@ def process_job(
         # (or centre it on the peak when a fixed clipLen was requested).
         frame["start"], frame["end"] = choose_clip_bounds(
             refined_time,
-            boundary_cuts,
+            boundary_pairs,
             dur,
             clip_min,
             clip_max,
@@ -2117,26 +2412,47 @@ def finalize(inp: FinalizeIn):
     }
 
 
-def edit_clip(source, output, aspect, crop_mode, fade):
+def edit_clip(source, output, aspect, crop_mode, fade, slowmo=False, headroom=0.42,
+              card_aspect="1:1", radius=48, fade_out=None, border=5):
     """Reframe an already-rendered full-res clip to a short-form aspect.
     Unlike render_clip this takes a finished file (no -ss/-t) and just applies
-    the crop/scale/fade filter. crop_mode "smart" pans the vertical window to
-    keep the player in shot; "center" keeps the middle."""
+    the crop/scale/fade filter. ``fade`` is the intro fade-IN and ``fade_out``
+    the outro fade-OUT (defaults to ``fade`` when omitted). crop_mode "smart"
+    pans the vertical window to keep the player in shot; "center" keeps the
+    middle; "template" puts the full uncropped frame in a middle band with room
+    above/below for branding; "card" is a rounded-corner 1:1 cutout on black
+    (with a thin white border); "card_blur" is the same cutout over a blurred
+    zoom of the clip. slowmo slows ~1s around the peak for a dramatic kill
+    moment."""
 
     dur = probe(ProbeIn(path=os.path.relpath(source, MEDIA)))["duration"]
 
-    # Smart crop: detect where the player sits and pan the crop toward them.
-    cx = 0.5
+    # Smart crop: track the player over time and pan to follow (biased to
+    # centre so the crosshair/action stays in frame).
+    cx_expr = None
     if crop_mode == "smart":
-        tmp = os.path.join(os.path.dirname(output), f".sub_{os.path.basename(output)}")
-        sub = _extract_clip_frames(source, 0.0, dur, tmp)
-        cx = subject_center_x(sub)
-        print(f"SMART CROP cx={cx:.3f} for {os.path.basename(source)}", flush=True)
-        shutil.rmtree(tmp, ignore_errors=True)
+        pts = track_subject_x(source, dur, os.path.dirname(output))
+        cx_expr = pan_x_expr(pts)
+        print(f"SMART TRACK {len(pts)} pts for {os.path.basename(source)}", flush=True)
 
     flag, filter_string, extra_maps = build_video_filter(
-        aspect, crop_mode, fade, dur, cx=cx
+        aspect, crop_mode, fade, dur, cx_expr=cx_expr, headroom=headroom,
+        card_aspect=card_aspect, radius=radius, fade_out=fade_out, border=border
     )
+    if slowmo and flag == "-vf":
+        # Dramatic slow: split the clip into pre / peak / post, slow the ~1.5s
+        # peak window to 0.5x, concat. Audio dropped (slow-mo desyncs it).
+        peak = find_motion_peak(source, dur, os.path.dirname(output))
+        a = max(0.0, peak - 0.75); b = min(dur, peak + 0.75)
+        filter_string = (
+            f"{filter_string},split=3[p0][p1][p2];"
+            f"[p0]trim=0:{a:.2f},setpts=PTS-STARTPTS[s0];"
+            f"[p1]trim={a:.2f}:{b:.2f},setpts=2.0*(PTS-STARTPTS)[s1];"
+            f"[p2]trim={b:.2f},setpts=PTS-STARTPTS[s2];"
+            f"[s0][s1][s2]concat=n=3:v=1:a=0[v]"
+        )
+        flag = "-filter_complex"
+        extra_maps = ["-map", "[v]"]
     cmd = ["ffmpeg", "-y", "-i", source, flag, filter_string] + extra_maps + [
         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
@@ -2149,14 +2465,21 @@ def edit_clip(source, output, aspect, crop_mode, fade):
 class EditIn(BaseModel):
     jobId: str
     aspect: str = "9:16"
-    fade: float = 0.5
+    fade: float = 0.5         # intro fade-IN seconds (quick)
+    fadeOut: float = 1.0      # outro fade-OUT seconds (slower, softer ending)
+    headroom: float = 0.42    # template: fraction of empty space above the video (rest below)
+    cardAspect: str = "1:1"   # card: crop aspect of the rounded-corner gameplay window (taller = more zoom)
+    radius: int = 48          # card: corner radius in px
+    borderWidth: int = 0      # card (black) only: white border ring thickness in px (0 = none)
 
 
 @app.post("/edit")
 def edit(inp: EditIn):
-    """Reframe EVERY rendered clip into two variants: a smart-cropped vertical
-    (player tracked) and a blurred-background vertical. Mirrors the renders
-    layout (flat or segment_*) under work/<jobId>/edited/cropped and /blurred."""
+    """Reframe EVERY rendered clip into two variants of the SAME rounded 1:1
+    cutout (pushed down 60/40): a CARD on a solid black background with a thin
+    white border, and a BLURRED version of that same cutout over a blurred zoom
+    of the clip. Mirrors the renders layout (flat or segment_*) under
+    work/<jobId>/edited/card and /blurred."""
 
     renders = os.path.join(MEDIA, "work", inp.jobId, "renders")
     if not os.path.isdir(renders):
@@ -2169,15 +2492,18 @@ def edit(inp: EditIn):
         return {"ok": False, "reason": "no clips rendered"}
 
     out_dir = os.path.join(MEDIA, "work", inp.jobId, "edited")
-    cropped, blurred = [], []
+    card, blurred = [], []
 
     for src in sources:
         rel = os.path.relpath(src, renders)
-        for mode, dest in (("smart", "cropped"), ("blur", "blurred")):
+        for mode, dest in (("card", "card"), ("card_blur", "blurred")):
             out_file = os.path.join(out_dir, dest, rel)
             os.makedirs(os.path.dirname(out_file), exist_ok=True)
-            edit_clip(src, out_file, inp.aspect, mode, inp.fade)
+            edit_clip(src, out_file, inp.aspect, mode, inp.fade,
+                      headroom=inp.headroom, card_aspect=inp.cardAspect,
+                      radius=inp.radius, fade_out=inp.fadeOut,
+                      border=inp.borderWidth)
             relout = f"work/{inp.jobId}/edited/{dest}/{rel.replace(os.sep, '/')}"
-            (cropped if mode == "smart" else blurred).append(relout)
+            (card if mode == "card" else blurred).append(relout)
 
-    return {"ok": True, "cropped": cropped, "blurred": blurred}
+    return {"ok": True, "card": card, "blurred": blurred}
