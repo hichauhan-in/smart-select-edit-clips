@@ -13,13 +13,16 @@ helper API (`helper/app.py`) was aligned to this flow.
 
 **Status: NO CHANGE REQUIRED.**
 
-The API now accepts exactly these fields. Confirm your JSON body still reads:
+The API still accepts your existing body. To get **variable-length clips that
+cut on natural scene changes**, add `clipMin` and `clipMax` instead of relying
+on a fixed `clipLen`:
 
 ```json
 {
   "path": "{{ $json.path }}",
   "jobId": "{{ $json.jobId }}",
-  "clipLen": 15,
+  "clipMin": 10,
+  "clipMax": 20,
   "sampleInterval": 2,
   "topMotion": 20,
   "finalCandidates": 4
@@ -27,16 +30,29 @@ The API now accepts exactly these fields. Confirm your JSON body still reads:
 ```
 
 What each field now does in the API:
-- `clipLen`         -> length of each highlight clip (seconds)
+- `clipLen`         -> fixed clip length (seconds). Used only when `clipMin`/`clipMax` are 0.
+- `clipMin`         -> shortest allowed clip (seconds). 0 = use fixed `clipLen`.
+- `clipMax`         -> longest allowed clip (seconds). 0 = use fixed `clipLen`.
 - `sampleInterval`  -> fallback frame sampling interval when scene detection finds too few scenes
 - `topMotion`       -> how many top-motion candidates to keep before scoring
 - `finalCandidates` -> how many final clips to return
+
+**How the range works:** the clip is centred on the busiest moment, then its
+start and end snap to the nearest scene cuts so it begins and ends on a real
+visual change — but the total length is always kept between `clipMin` and
+`clipMax`. So `clipMin:10, clipMax:20` yields clips somewhere in 10–20s, each
+ending where the action actually changes. Leave both at 0 (or omit them) to
+keep the old exact `clipLen` behaviour.
+
+> Because clips are now variable length, the API also keeps them from
+> overlapping by their real start/end times. `minGap` (optional) adds extra
+> spacing between kept clips.
 
 ---
 
 ## 2. PICK BEST  (Code node)
 
-**Status: NO CHANGE REQUIRED** (the fields `vision_score` and `frame_rel`
+**Status: NO CHANGE REQUIRED.** (the fields `vision_score` and `frame_rel`
 now exist in the API response). Below is the verified code. Replace your
 node body with this only if you want the extra safety comments / guards.
 
@@ -97,7 +113,7 @@ Field reference (each candidate object returned by `/candidates`):
 
 ## 3. RENDER CLIPS  (HTTP Request -> POST /render)
 
-**Status: UPDATED for vertical Shorts + best-to-worst ranking.**
+**Status: NO CHANGE REQUIRED.**
 
 The API now:
 - returns each candidate with an explicit `rank` (1 = best), already sorted

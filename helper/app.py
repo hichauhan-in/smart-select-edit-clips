@@ -721,6 +721,12 @@ class CandIn(BaseModel):
     path: str
     jobId: str
     clipLen: float = 15.0
+    # Variable clip length. Leave both 0 to keep fixed clipLen behaviour.
+    # Set clipMin and/or clipMax to let the system choose a NATURAL length in
+    # that range, ending the clip where the scene actually changes.
+    #   e.g. clipMin=10, clipMax=20  -> clips run 10-20s, cut on scene boundaries
+    clipMin: float = 0.0
+    clipMax: float = 0.0
     sampleInterval: float = 2.0
     topMotion: int = 20
     finalCandidates: int = 4
@@ -916,6 +922,78 @@ def merge_seed_times(*lists, min_gap, max_count):
         kept = [kept[int(i * step)] for i in range(max_count)]
 
     return kept
+
+def choose_clip_bounds(peak, scene_cuts, dur, clip_min, clip_max):
+    """
+    Pick a natural ``[start, end]`` for one highlight.
+
+    The length stays within ``[clip_min, clip_max]`` but, instead of a fixed
+    stopwatch length, the start and end are snapped to nearby scene cuts so the
+    clip BEGINS and ENDS on a real visual change (a new room, the kill cam
+    ending, etc). The peak (busiest) moment always stays inside the window.
+
+    When ``clip_min`` and ``clip_max`` are (almost) equal we keep the old
+    behaviour: a fixed-length clip centred on the peak.
+    """
+    clip_min = max(1.0, clip_min)
+    clip_max = max(clip_min, clip_max)
+    target = (clip_min + clip_max) / 2.0
+
+    # Fixed length requested -> centre on the peak, no snapping.
+    if clip_max - clip_min < 1.0:
+        start = max(0.0, peak - target / 2.0)
+        end = min(dur, start + target)
+        if end - start < target:
+            start = max(0.0, end - target)
+        return round(start, 2), round(end, 2)
+
+    cuts = sorted(scene_cuts)
+
+    # START: the latest scene cut shortly before the peak (the action's start).
+    # Must leave >= 0.5s of lead-in and sit no further back than clip_max.
+    start = None
+    for s in cuts:
+        if peak - clip_max <= s <= peak - 0.5:
+            start = s
+    if start is None:
+        start = peak - target / 2.0
+
+    # END: the earliest scene cut after the peak that yields a valid length.
+    # Cuts are sorted, so once a cut would exceed clip_max we can stop looking.
+    end = None
+    for e in cuts:
+        if e <= peak:
+            continue
+        length = e - start
+        if length < clip_min:
+            continue
+        if length > clip_max:
+            break
+        end = e
+        break
+    if end is None:
+        end = start + target
+
+    # Enforce the length range.
+    length = end - start
+    if length < clip_min:
+        end = start + clip_min
+    elif length > clip_max:
+        end = start + clip_max
+
+    # Clamp to the video and guarantee the peak stays inside the window.
+    start = max(0.0, start)
+    end = min(dur, end)
+    if end - start < clip_min:
+        start = max(0.0, end - clip_max)
+    if peak < start:
+        start = max(0.0, peak - 0.5)
+    if peak > end:
+        end = min(dur, peak + 0.5)
+        if end - start > clip_max:
+            start = max(0.0, end - clip_max)
+
+    return round(start, 2), round(end, 2)
 
 # Target pixel size for each supported aspect ratio. Shorts/Reels/TikTok all
 # use 1080x1920; the rest follow the same 1080-wide convention. "source"
@@ -1206,6 +1284,17 @@ def process_job(
     if job_end is None:
         job_end = dur
 
+    # ---- Clip length range -------------------------------------------------
+    # clipLen alone => fixed-length clips (back-compat). Provide clipMin and/or
+    # clipMax to let the system pick a NATURAL length in that range, snapping
+    # the start/end to nearby scene cuts. clip_target drives seeding, counts
+    # and the refine window so everything still scales sensibly.
+    clip_min = inp.clipMin if inp.clipMin and inp.clipMin > 0 else inp.clipLen
+    clip_max = inp.clipMax if inp.clipMax and inp.clipMax > 0 else inp.clipLen
+    if clip_max < clip_min:
+        clip_max = clip_min
+    clip_target = (clip_min + clip_max) / 2.0
+
     # Smart-loudness curve for the whole segment (computed once).
     # Used later to score each clip by its loudest sudden impact sound.
     audio_times, audio_vals = _loudness_curve(full)
@@ -1233,6 +1322,10 @@ def process_job(
     # trips the strict 0.30, so the adaptive step keeps us off the dumb grid.
     scene_pairs = detect_scenes(full)
 
+    # Every detected cut (at the low base threshold) is a potential clip
+    # boundary; variable-length clips are later snapped to these.
+    boundary_cuts = sorted(t for (t, _s) in scene_pairs)
+
     scene_threshold = 0.30
     scene_times = []
     for scene_threshold in (0.30, 0.20, 0.12):
@@ -1253,7 +1346,7 @@ def process_job(
     peak_times = audio_peak_times(
         audio_times,
         audio_vals,
-        min_gap=max(2.0, inp.clipLen / 2),
+        min_gap=max(2.0, clip_target / 2),
         max_peaks=MAX_COARSE_FRAMES
     )
 
@@ -1266,7 +1359,7 @@ def process_job(
     sample_times = merge_seed_times(
         scene_times,
         peak_times,
-        min_gap=max(1.0, inp.clipLen / 4),
+        min_gap=max(1.0, clip_target / 4),
         max_count=MAX_COARSE_FRAMES
     )
 
@@ -1285,7 +1378,7 @@ def process_job(
         sample_times = merge_seed_times(
             sample_times,
             sample_video(dur, interval=interval),
-            min_gap=max(1.0, inp.clipLen / 4),
+            min_gap=max(1.0, clip_target / 4),
             max_count=MAX_COARSE_FRAMES
         )
 
@@ -1303,8 +1396,8 @@ def process_job(
 
     frames = []
     for i, t in enumerate(sample_times):
-        start = max(0.0, t - inp.clipLen / 2)
-        end = min(dur, start + inp.clipLen)
+        start = max(0.0, t - clip_target / 2)
+        end = min(dur, start + clip_target)
         fp = os.path.join(frames_dir, f"cand_{i}.jpg")
         _extract_frame(full, t, fp)
         frames.append({
@@ -1335,7 +1428,7 @@ def process_job(
     reverse=True
     )
 
-    max_possible = int(dur / inp.clipLen)
+    max_possible = int(dur / clip_target)
 
     candidate_count = max(
         2,
@@ -1349,10 +1442,9 @@ def process_job(
 
     interesting = motion_frames[:candidate_count]
 
-    # Refine search window scales with the clip (clipLen / 3), clamped so it
+    # Refine search window scales with the clip (clip_target / 3), clamped so it
     # is never less than 7 s or more than 15 s on each side of the motion peak.
-    # e.g. 10 s -> 7, 15 s -> 7, 30 s -> 10, 45 s and up -> 15.
-    refine_window = max(7.0, min(inp.clipLen / 3.0, 15.0))
+    refine_window = max(7.0, min(clip_target / 3.0, 15.0))
 
     for frame in interesting:
 
@@ -1370,13 +1462,14 @@ def process_job(
         # The peak still decides where to center the clip (refined_time).
         frame["motion"] = refined_mean
 
-        frame["start"] = max(
-            0,
-            refined_time - inp.clipLen / 2
-        )
-        frame["end"] = min(
+        # Snap the clip to natural scene boundaries within the length range
+        # (or centre it on the peak when a fixed clipLen was requested).
+        frame["start"], frame["end"] = choose_clip_bounds(
+            refined_time,
+            boundary_cuts,
             dur,
-            frame["start"] + inp.clipLen
+            clip_min,
+            clip_max
         )
 
     print("\n===== AFTER REFINEMENT =====", flush=True)
@@ -1463,7 +1556,7 @@ def process_job(
             frame["yolo_norm"],
             frame["ocr_norm"],
             frame["audio_norm"],
-            inp.clipLen
+            frame["end"] - frame["start"]
         )
 
         frame["gameplay"] = gameplay
@@ -1502,20 +1595,19 @@ def process_job(
         reverse=True
     )
 
-    # Effective spacing between kept clips. minGap == 0 means "auto" -> one
-    # clip length, so highlights may sit back-to-back. We never allow a gap
-    # smaller than clipLen, otherwise two kept clips would overlap in time.
-    min_gap = inp.minGap if inp.minGap and inp.minGap > 0 else inp.clipLen
-    min_gap = max(min_gap, inp.clipLen)
+    # Clips now have variable lengths, so we reject by ACTUAL time overlap of
+    # the [start, end] windows rather than a fixed centre-to-centre gap.
+    # minGap (when > 0) adds extra breathing room between kept clips.
+    extra_gap = inp.minGap if inp.minGap and inp.minGap > 0 else 0.0
 
     selected = []
 
     for frame in approved:
-        keep = True
-        for chosen in selected:
-            if abs(frame["time"] - chosen["time"]) < min_gap:
-                keep = False
-                break
+        keep = all(
+            frame["end"] + extra_gap <= chosen["start"]
+            or frame["start"] >= chosen["end"] + extra_gap
+            for chosen in selected
+        )
         if keep:
             selected.append(frame)
         if len(selected) == inp.finalCandidates:
@@ -1642,20 +1734,21 @@ def candidates(inp: CandIn):
         reverse=True
     )
 
-    # Same auto / non-overlapping spacing rule as inside process_job, applied
-    # when merging clips from multiple segments of a long video.
-    merge_gap = inp.minGap if inp.minGap and inp.minGap > 0 else inp.clipLen
-    merge_gap = max(merge_gap, inp.clipLen)
+    # Same non-overlapping rule as inside process_job, by actual [start, end]
+    # overlap (clips are variable length), applied when merging clips from
+    # multiple segments of a long video.
+    extra_gap = inp.minGap if inp.minGap and inp.minGap > 0 else 0.0
 
     final = []
 
     for frame in all_selected:
 
         if all(
-            abs(frame["time"] - f["time"]) >= merge_gap
+            frame["end"] + extra_gap <= f["start"]
+            or frame["start"] >= f["end"] + extra_gap
             for f in final
         ):
-                final.append(frame)
+            final.append(frame)
 
     # Optional overall cap across the whole video (all segments combined).
     # final is already sorted by final_score, so we keep the highest scored.
