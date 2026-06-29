@@ -328,6 +328,27 @@ def yolo_score(frame_path):
 
     return score, detected
 
+
+def subject_center_x(frames):
+    """Average horizontal centre (0..1) of detected people across frames, used
+    to pan a vertical crop so the player stays in shot. Returns 0.5 (frame
+    centre) when no person is found."""
+    xs = []
+    for fp in frames:
+        res = YOLO_MODEL(fp, verbose=False)[0]
+        boxes = res.boxes
+        if boxes is None or len(boxes) == 0:
+            continue
+        names = res.names
+        for cls, xc, w in zip(
+            boxes.cls.tolist(),
+            boxes.xywhn[:, 0].tolist(),
+            boxes.xywhn[:, 2].tolist(),
+        ):
+            if names[int(cls)] == "person":
+                xs.append(xc)
+    return sum(xs) / len(xs) if xs else 0.5
+
 def _extract_clip_frames(full, start, end, out_dir):
 
     os.makedirs(out_dir, exist_ok=True)
@@ -1041,7 +1062,32 @@ def merge_seed_times(*lists, min_gap, max_count):
 
     return kept
 
-def choose_clip_bounds(peak, scene_cuts, dur, clip_min, clip_max):
+def find_motion_lull(video_path, lo, hi, job_dir, step=0.5):
+    """Return the time of lowest motion inside [lo, hi]. Used to end a clip on a
+    calm moment when there is no scene cut to snap to, so a continuous scene
+    stops where the action actually subsides instead of at a fixed stopwatch."""
+    if hi - lo < step or not video_path:
+        return None
+    work = os.path.join(job_dir, "refine", f"lull_{int(lo)}")
+    os.makedirs(work, exist_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-y", "-ss", str(lo), "-i", video_path, "-t", str(hi - lo),
+         "-vf", f"fps={1.0/step}", "-q:v", "5", os.path.join(work, "l_%04d.jpg")],
+        capture_output=True
+    )
+    frames = sorted(glob.glob(os.path.join(work, "l_*.jpg")))
+    best_t, best_m, prev = None, None, None
+    for i, img in enumerate(frames):
+        if prev is not None:
+            m = motion_score(prev, img)
+            if best_m is None or m < best_m:
+                best_m, best_t = m, lo + i * step
+        prev = img
+    return best_t
+
+
+def choose_clip_bounds(peak, scene_cuts, dur, clip_min, clip_max,
+                       video_path=None, job_dir=None):
     """
     Pick a natural ``[start, end]`` for one highlight.
 
@@ -1076,21 +1122,27 @@ def choose_clip_bounds(peak, scene_cuts, dur, clip_min, clip_max):
     if start is None:
         start = peak - target / 2.0
 
-    # END: the earliest scene cut after the peak that yields a valid length.
-    # Cuts are sorted, so once a cut would exceed clip_max we can stop looking.
-    end = None
-    for e in cuts:
-        if e <= peak:
-            continue
-        length = e - start
-        if length < clip_min:
-            continue
-        if length > clip_max:
-            break
-        end = e
-        break
-    if end is None:
-        end = start + target
+    # END: snap to the scene cut whose length is closest to the target, so the
+    # clip ends on a real visual change rather than a stopwatch. Only cuts that
+    # land after the peak and keep length within [clip_min, clip_max] qualify;
+    # among those pick the one nearest the ideal target length.
+    valid_ends = [
+        e for e in cuts
+        if e > peak and clip_min <= (e - start) <= clip_max
+    ]
+    if valid_ends:
+        end = min(valid_ends, key=lambda e: abs((e - start) - target))
+    else:
+        # No scene cut in range: end at the calmest moment between clip_min and
+        # clip_max so a continuous scene stops where action drops, not on a
+        # fixed timer. Falls back to target if motion can't be sampled.
+        lull = find_motion_lull(
+            video_path,
+            min(dur, start + clip_min),
+            min(dur, start + clip_max),
+            job_dir,
+        )
+        end = lull if lull else start + target
 
     # Enforce the length range.
     length = end - start
@@ -1125,7 +1177,7 @@ ASPECT_DIMS = {
 }
 
 
-def build_video_filter(aspect, crop_mode, fade_dur, duration):
+def build_video_filter(aspect, crop_mode, fade_dur, duration, cx=0.5):
     """
     Build the ffmpeg filter for reframing a clip to ``aspect`` with the chosen
     ``crop_mode`` plus optional fade in/out.
@@ -1172,8 +1224,12 @@ def build_video_filter(aspect, crop_mode, fade_dur, duration):
         return "-vf", chain, []
 
     # Default "center": crop the centre strip to the target aspect, then scale.
+    # "smart": same crop width but panned toward the subject (cx 0..1) so the
+    # player isn't cut off; cx=0.5 is identical to center.
+    cx = min(0.85, max(0.15, cx))
     chain = (
-        f"crop='min(iw,ih*{W}/{H})':'min(ih,iw*{H}/{W})',"
+        f"crop='min(iw,ih*{W}/{H})':'min(ih,iw*{H}/{W})':"
+        f"'(iw-min(iw,ih*{W}/{H}))*{cx:.3f}':0,"
         f"scale={W}:{H}"
         f"{fades}"
     )
@@ -1587,7 +1643,9 @@ def process_job(
             boundary_cuts,
             dur,
             clip_min,
-            clip_max
+            clip_max,
+            video_path=full,
+            job_dir=job_dir
         )
 
     print("\n===== AFTER REFINEMENT =====", flush=True)
@@ -2032,10 +2090,9 @@ def finalize(inp: FinalizeIn):
     for entry in os.listdir(work_dir):
         src = os.path.join(work_dir, entry)
 
-        # Keep the final renders in work.
-        if entry == "renders":
+        # Keep the final renders + edited shorts in work.
+        if entry in ("renders", "edited"):
             continue
-
         # Source video -> archive, named after the job.
         if entry == "source.mp4":
             dst = os.path.join(archive_dir, f"{inp.jobId}.mp4")
@@ -2058,3 +2115,69 @@ def finalize(inp: FinalizeIn):
         "moved": moved,
         "temp": f"temp/{inp.jobId}",
     }
+
+
+def edit_clip(source, output, aspect, crop_mode, fade):
+    """Reframe an already-rendered full-res clip to a short-form aspect.
+    Unlike render_clip this takes a finished file (no -ss/-t) and just applies
+    the crop/scale/fade filter. crop_mode "smart" pans the vertical window to
+    keep the player in shot; "center" keeps the middle."""
+
+    dur = probe(ProbeIn(path=os.path.relpath(source, MEDIA)))["duration"]
+
+    # Smart crop: detect where the player sits and pan the crop toward them.
+    cx = 0.5
+    if crop_mode == "smart":
+        tmp = os.path.join(os.path.dirname(output), f".sub_{os.path.basename(output)}")
+        sub = _extract_clip_frames(source, 0.0, dur, tmp)
+        cx = subject_center_x(sub)
+        print(f"SMART CROP cx={cx:.3f} for {os.path.basename(source)}", flush=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    flag, filter_string, extra_maps = build_video_filter(
+        aspect, crop_mode, fade, dur, cx=cx
+    )
+    cmd = ["ffmpeg", "-y", "-i", source, flag, filter_string] + extra_maps + [
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", output,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    print("EDIT:", output, "rc=", r.returncode, flush=True)
+
+
+class EditIn(BaseModel):
+    jobId: str
+    aspect: str = "9:16"
+    fade: float = 0.5
+
+
+@app.post("/edit")
+def edit(inp: EditIn):
+    """Reframe EVERY rendered clip into two variants: a smart-cropped vertical
+    (player tracked) and a blurred-background vertical. Mirrors the renders
+    layout (flat or segment_*) under work/<jobId>/edited/cropped and /blurred."""
+
+    renders = os.path.join(MEDIA, "work", inp.jobId, "renders")
+    if not os.path.isdir(renders):
+        return {"ok": False, "reason": f"no renders for {inp.jobId}"}
+
+    # All rendered clips, flat and per-segment, with their path relative to
+    # renders/ so each variant folder keeps the same structure.
+    sources = sorted(glob.glob(os.path.join(renders, "**", "clip_*.mp4"), recursive=True))
+    if not sources:
+        return {"ok": False, "reason": "no clips rendered"}
+
+    out_dir = os.path.join(MEDIA, "work", inp.jobId, "edited")
+    cropped, blurred = [], []
+
+    for src in sources:
+        rel = os.path.relpath(src, renders)
+        for mode, dest in (("smart", "cropped"), ("blur", "blurred")):
+            out_file = os.path.join(out_dir, dest, rel)
+            os.makedirs(os.path.dirname(out_file), exist_ok=True)
+            edit_clip(src, out_file, inp.aspect, mode, inp.fade)
+            relout = f"work/{inp.jobId}/edited/{dest}/{rel.replace(os.sep, '/')}"
+            (cropped if mode == "smart" else blurred).append(relout)
+
+    return {"ok": True, "cropped": cropped, "blurred": blurred}

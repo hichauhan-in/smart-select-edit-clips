@@ -207,28 +207,66 @@ The response is `{ "clips": [ "work/<jobId>/renders/clip_1.mp4", ... ] }` where
 
 ---
 
-## 4. CLEANUP  (HTTP Request -> POST /finalize)  **REQUIRED for cleanup**
+## 4. EDIT  (HTTP Request -> POST /edit)
 
-Add ONE node after Render Clips. Without it nothing is moved and every job
+**Status: BODY CHANGED.** `cropMode` removed - both variants are always made.
+
+Render keeps the **full resolution**. Edit reframes EVERY rendered clip into
+TWO vertical variants. Add this node AFTER Render, BEFORE Cleanup.
+
+```json
+{
+    "jobId": "{{ $('Job Info').item.json.jobId }}",
+    "aspect": "9:16",
+    "fade": 0.5
+}
+```
+
+Method: POST · URL: `http://helper:8000/edit`.
+
+Processes all clips in `renders/` (flat + every `segment_*`). For each it makes
+a smart-cropped (player-tracked) and a blurred-background version, mirroring the
+renders layout:
+
+```
+work/<jobId>/edited/cropped/clip_1.mp4   blurred/clip_1.mp4
+                    cropped/segment_2/clip_3.mp4  ...
+```
+
+Response: `{ "cropped": [...], "blurred": [...] }`.
+
+- `aspect` -> `9:16` | `4:5` | `1:1` | `16:9` | `source`
+- `fade`   -> fade in/out seconds
+- crop = smart YOLO pan (player tracked) · blur = full frame, no bars/HUD loss
+
+> `jobId` must come from **Job Info** - Render's output only has `clips`.
+
+---
+
+## 5. CLEANUP  (HTTP Request -> POST /finalize)  **REQUIRED for cleanup**
+
+**Status: NO CHANGE REQUIRED.** Node already added with current config.
+
+Add ONE node after Edit. Without it nothing is moved and every job
 keeps `source.mp4 / frames / refine / clips / renders` under `work/<jobId>`.
 
 ```json
 {
-    "jobId": "{{ $json.jobId }}",
-    "name": "{{ $json.name }}"
+    "jobId": "{{ $('Job Info').item.json.jobId }}",
+    "name": "{{ $('Job Info').item.json.name }}"
 }
 ```
 
 Method: POST · URL: `http://helper:8000/finalize`.
 
 After it runs, the job folder is cleaned:
-- `work/<jobId>/renders/` -> kept (your final clips)
-- `source.mp4` -> moved to `media/archive/<name>.mp4`
+- `work/<jobId>/renders/` + `work/<jobId>/edited/` -> kept
+- `source.mp4` -> moved to `media/archive/<jobId>.mp4`
 - `frames/`, `refine/`, `clips/`, `segment_*` -> moved to `media/temp/<jobId>/`
 - nothing deleted; clear `media/temp` manually when you want.
 
-> `jobId` and `name` both come from the **Claim/Job Info** node. If Render's
-> last item dropped them, re-add them before this node.
+> `jobId` and `name` come from **Job Info**. Render's output only has `clips`,
+> so reference the earlier node, not `$json`.
 
 ---
 
@@ -254,3 +292,12 @@ nothing is hardcoded except a vision cap of 6.
 ## Nothing else changes
 
 JOB INFO, CLAIM, PROBE, and GOT A CLIP? are unaffected by the API edits.
+
+---
+
+## Node order
+
+```
+Claim -> Probe -> Find Best Moments (/candidates) -> Pick Best
+   -> Render (/render, source) -> Edit (/edit, 9:16) -> Cleanup (/finalize)
+```

@@ -25,7 +25,7 @@ flowchart TD
     L --> M[approved: final_score *= 0.5 + 0.5*confidence<br/>rejected gameplay/approve false dropped]
     M --> N[select finalCandidates spaced by min_gap]
     N --> O[merge segments, dedupe by merge_gap, sort]
-    O --> P[n8n PICK BEST -> RENDER]
+    O --> P[n8n PICK BEST -> RENDER -> EDIT -> CLEANUP]
 ```
 
 In words: claim -> probe -> build an audio loudness curve + scene-detect to get
@@ -85,9 +85,13 @@ media/
     clips/                   <- STAGE 3: 5 stills per surviving clip (OCR+vision)
       clip_0/ frame_0.jpg ... frame_4.jpg
       clip_3/ ...
-    renders/                 <- STAGE 4: the finished MP4 clips
+    renders/                 <- STAGE 4: full-res MP4 clips (clip_1 = best)
       clip_1.mp4 (best) ...
-  output/                    <- final posted/archived clips
+    edited/                  <- STAGE 5: vertical shorts, two variants each
+      cropped/  clip_1.mp4   <- smart YOLO pan (player tracked)
+      blurred/  clip_1.mp4   <- full frame on blurred bg, no bars
+  archive/                   <- source.mp4 moved here as <jobId>.mp4 (cleanup)
+  temp/<jobId>/              <- frames/refine/clips parked here (cleanup)
 ```
 
 > Long videos (> 15 min) are split first, so you'll instead see
@@ -102,7 +106,8 @@ media/
 | `frames/` | one still per *seed timestamp* — a cheap "look here" scan | coarse scan, after seeding | = the **"Sampling N frames"** log line = `min(seeds, 160)`. Seeds = scene cuts + audio peaks (+ grid backstop) |
 | `refine/candidate_<sec>/` | a burst of stills **around one promising moment**, used to find the exact motion peak | after the top motion candidates are chosen | folders = `candidate_count = max(2, min(topMotion, floor(dur / clipLen)))`; stills per folder ≈ `4 × refine_window` (fps 2, both sides) where `refine_window = clamp(clipLen/3, 7, 15)` |
 | `clips/clip_<idx>/` | exactly **5 evenly-spaced stills** (0%, 25%, 50%, 75%, 95%) of one final-length clip — fed to OCR and the vision model | OCR + audio scoring | folders = `candidate_count`; **always 5 stills** each |
-| `renders/` | the finished, cropped, faded MP4s | n8n `/render` | = number of clips n8n sends (top 3 for Shorts, or `finalCandidates`) |
+| `renders/` | the finished full-res MP4s | n8n `/render` | = number of clips n8n sends (top 3 for Shorts, or `finalCandidates`) |
+| `edited/cropped/` + `edited/blurred/` | vertical shorts, 2 variants per render | n8n `/edit` | = renders × 2 |
 
 ### Max at each phase (and which counts match)
 
