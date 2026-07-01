@@ -1363,7 +1363,8 @@ ASPECT_DIMS = {
 
 def build_video_filter(aspect, crop_mode, fade_dur, duration, cx=0.5,
                        cx_expr=None, zoom=None, hud_safe=False, headroom=0.42,
-                       card_aspect="1:1", radius=48, fade_out=None, border=5):
+                       card_aspect="1:1", radius=48, fade_out=None, border=5,
+                       side_margin=48):
     """
     Build the ffmpeg filter for reframing a clip to ``aspect`` with the chosen
     ``crop_mode`` plus optional fade in/out.
@@ -1431,17 +1432,20 @@ def build_video_filter(aspect, crop_mode, fade_dur, duration, cx=0.5,
 
     if crop_mode in ("card", "card_blur"):
         # Screenshot-style card: crop the gameplay to a taller (default 1:1)
-        # window, round the corners and place it full-width, pushed down so the
-        # empty space splits 60% above / 40% below. The background is either a
-        # solid BLACK canvas ("card") or a BLURRED zoom of the frame itself
-        # ("card_blur"). The black card also gets a thin white border ring
-        # tracing the rounded cutout.
+        # window, round the corners and place it inset from the left/right
+        # (``side_margin`` px each side) so the background shows around it, and
+        # pushed down so the empty space splits 60% above / 40% below. The
+        # background is either a solid BLACK canvas ("card") or a BLURRED zoom
+        # of the frame itself ("card_blur"). The black card also gets a thin
+        # white border ring tracing the rounded cutout.
         try:
             caw, cah = (float(x) for x in card_aspect.split(":"))
             car = caw / cah
         except Exception:
             car = 1.0
-        Wc = W
+        sm = max(0, int(side_margin))
+        Wc = W - 2 * sm
+        Wc -= Wc % 2
         Hc = int(round(Wc / car))
         Hc -= Hc % 2
         r = max(0, int(radius))
@@ -1455,7 +1459,8 @@ def build_video_filter(aspect, crop_mode, fade_dur, duration, cx=0.5,
                 f"if(lte(hypot(abs(X-(W-1)/2)-((W-1)/2-{rad}),abs(Y-(H-1)/2)-((H-1)/2-{rad})),{rad}),255,0),255)"
             )
 
-        # Card placement (top-left of the cutout): full width, 60/40 vertically.
+        # Card placement (top-left of the cutout): centred horizontally with a
+        # side_margin gap each side, 60/40 vertically.
         vx = (W - Wc) // 2
         oy = int(round((H - Hc) * 0.6))
         dur_s = f"{max(0.1, duration):.3f}"
@@ -2413,7 +2418,7 @@ def finalize(inp: FinalizeIn):
 
 
 def edit_clip(source, output, aspect, crop_mode, fade, slowmo=False, headroom=0.42,
-              card_aspect="1:1", radius=48, fade_out=None, border=5):
+              card_aspect="1:1", radius=48, fade_out=None, border=5, side_margin=48):
     """Reframe an already-rendered full-res clip to a short-form aspect.
     Unlike render_clip this takes a finished file (no -ss/-t) and just applies
     the crop/scale/fade filter. ``fade`` is the intro fade-IN and ``fade_out``
@@ -2437,7 +2442,8 @@ def edit_clip(source, output, aspect, crop_mode, fade, slowmo=False, headroom=0.
 
     flag, filter_string, extra_maps = build_video_filter(
         aspect, crop_mode, fade, dur, cx_expr=cx_expr, headroom=headroom,
-        card_aspect=card_aspect, radius=radius, fade_out=fade_out, border=border
+        card_aspect=card_aspect, radius=radius, fade_out=fade_out, border=border,
+        side_margin=side_margin
     )
     if slowmo and flag == "-vf":
         # Dramatic slow: split the clip into pre / peak / post, slow the ~1.5s
@@ -2471,6 +2477,7 @@ class EditIn(BaseModel):
     cardAspect: str = "1:1"   # card: crop aspect of the rounded-corner gameplay window (taller = more zoom)
     radius: int = 48          # card: corner radius in px
     borderWidth: int = 0      # card (black) only: white border ring thickness in px (0 = none)
+    sideMargin: int = 48      # card: horizontal inset each side so background shows around the card (px)
 
 
 @app.post("/edit")
@@ -2502,7 +2509,7 @@ def edit(inp: EditIn):
             edit_clip(src, out_file, inp.aspect, mode, inp.fade,
                       headroom=inp.headroom, card_aspect=inp.cardAspect,
                       radius=inp.radius, fade_out=inp.fadeOut,
-                      border=inp.borderWidth)
+                      border=inp.borderWidth, side_margin=inp.sideMargin)
             relout = f"work/{inp.jobId}/edited/{dest}/{rel.replace(os.sep, '/')}"
             (card if mode == "card" else blurred).append(relout)
 
