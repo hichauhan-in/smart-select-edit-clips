@@ -13,6 +13,30 @@ helper API (`helper/app.py`) was aligned to this flow.
 
 **Status: NO CHANGE REQUIRED.**
 
+> **What changed under the hood (no node edits needed):**
+> - **Whole-video dense scan (revamped core).** Each segment is now decoded ONCE
+>   into a dense timeline instead of sampling a few sparse frames. Good moments
+>   can no longer be missed because the shortlist skipped them.
+> - **Genre-agnostic "activity" curve, not raw motion.** Moments are ranked by
+>   motion *novelty* (a sudden burst above the local baseline) + audio *onset*
+>   (sudden loud events: hits, goals, crashes, explosions) — NOT raw motion.
+>   This is the fix for "person walking / looting / panning" clips: steady
+>   movement no longer scores high, so it stops dominating the picks. Works for
+>   any genre (open-world, racing, sports, platformers, 2D, fighting, shooters).
+> - **The vision model is the judge.** Each shortlisted moment gets an explicit
+>   0–10 "how entertaining is this" rating from the vision model, and that
+>   rating drives the ranking. It's told high motion does NOT mean exciting and
+>   to score idle walking / looting / menus low. Many moments per segment are
+>   sent to the model (the user accepted longer processing for better picks),
+>   and each clip is sampled with 8 frames so brief highlights aren't missed.
+> - **Coherent clip placement.** Clips are positioned over the real *burst* of
+>   action from the dense timeline, then snapped to nearby scene cuts, so they
+>   no longer start/stop at random points.
+> - **Balanced splitting of long videos.** A video over 15 min is split into the
+>   fewest EQUAL parts that each stay ≤ 15 min (20 min → 2×10 min, not 15+5;
+>   40 min → ~3×13.3 min). Each part is processed independently and its clips
+>   land in `renders/segment_N/`.
+
 The API still accepts your existing body. To get **variable-length clips that
 cut on natural scene changes**, add `clipMin` and `clipMax` instead of relying
 on a fixed `clipLen`:
@@ -290,19 +314,31 @@ After it runs, the job folder is cleaned:
 
 ## How the helper ranks clips (internal, no n8n change)
 
-The funnel is cheap-first, expensive-last. Counts scale with video length —
-nothing is hardcoded except a vision cap of 6.
+The pipeline decodes each segment ONCE, builds an activity timeline, then lets
+the vision model judge a generous shortlist. Counts scale with video length.
 
-1. **Coarse scan** — sample frames, score motion + YOLO. Keep top `topMotion` (≤20, capped by `duration / clipLen`).
-2. **Refine** — dense 0.5s motion sweep per candidate to find the exact peak + snap to scene cuts.
-3. **Pre-OCR gate** — keep half on cheap signals: motion 60% + audio 20% + YOLO 20%.
-4. **OCR + tech quality** — RapidOCR (CPU, ONNX) reads reward text; sharpness/brightness + scene-cut density scored from the same 5 stills.
-5. **Vision** — half of OCR survivors (≤6) judged by llava: gameplay/approve/confidence + hook/multikill/clutch/funny/vertical engagement boost.
-6. **Render** — `finalCandidates` per segment, deduped, ranked, capped by `maxCandidates`.
+1. **Dense scan** — decode the whole segment once into small grayscale stills;
+   compute a dense motion series (one pass, no per-candidate re-decodes).
+2. **Activity curve** — blend motion *novelty* (burst above local baseline) +
+   audio *onset* (sudden loud events) + a little absolute motion. This is what
+   ignores steady walking / panning and surfaces real events, any genre.
+3. **Candidate moments** — take the top activity peaks (spaced apart), place
+   each clip's start/end over the action burst and snap to nearby scene cuts.
+4. **Vision judging** — send the top `max(finalCandidates×4, 12)` moments (8
+   frames each) to the vision model, which returns a 0–10 rating + gameplay /
+   approve + engagement flags. The rating drives the ranking.
+5. **Select** — keep approved moments, rank by rating, pick `finalCandidates`
+   non-overlapping clips per segment (deduped, capped by `maxCandidates`).
+6. **Fill fields** — OCR / quality / YOLO run only on the final clips to
+   populate the API response fields.
 
-- **OCR engine:** RapidOCR (`rapidocr-onnxruntime`), EasyOCR fallback. CPU-only; AMD GPU not usable in Docker-on-Windows.
-- **Combined score:** motion .35, OCR .30, audio .13, quality .10, YOLO .07, cuts .05 — then ×vision confidence.
-- **Per segment:** a 40-min video splits into ~3 segments, each with its own `clips/`, `refine/`, and `renders/segment_N/` folders, ~3 clips each (fewer if short).
+- **Final score:** `rating ×0.85 + audio_norm ×0.08 + motion_norm ×0.07` — the
+  vision rating dominates; audio / motion are only tie-breakers.
+- **OCR engine:** RapidOCR (`rapidocr-onnxruntime`), EasyOCR fallback. CPU-only.
+- **Tuning env vars:** `SCAN_MAX_FRAMES` (700), `SCAN_WIDTH` (480) control the
+  dense scan cost; larger = finer but slower.
+- **Per segment:** a 40-min video splits into ~3 segments, each with its own
+  `scan/`, `clips/`, and `renders/segment_N/` folders, ~3 clips each.
 
 ---
 
