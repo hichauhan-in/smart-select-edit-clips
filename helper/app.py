@@ -563,9 +563,12 @@ NOT a highlight (reject, low rating) - these are the exact traps to avoid:
 dropping in / parachuting / gliding / landing, running or driving around with
 no enemies, looting crates or bodies, picking up ammo / weapons / cash / armor,
 crafting, opening doors, reading the map, inventory, menus, shops, loadouts,
-buy / respawn screens, idle standing, or slow "walking between fights". These
-are boring EVEN WHEN the camera moves fast or the scenery flies by. When in
-doubt, REJECT.
+buy / respawn screens, idle standing, slow "walking between fights", or the
+character just standing / looting while a voice talks (loud talking is NOT
+action). These are boring EVEN WHEN the camera moves fast, the scenery flies
+by, or someone is speaking loudly. The clip must show something ACTUALLY
+HAPPENING across the frames, not just noise on the soundtrack. When in doubt,
+REJECT.
 
 --- Computer Vision Analysis ---
 These scores are RELATIVE to the other candidate clips detected in THIS
@@ -575,7 +578,7 @@ NOT absolute quality measures, so treat them as ranking hints, not truth.
 Motion Score : {motion:.2f}   (relative on-screen movement - WARNING: high motion ALSO comes from camera panning, walking, driving and looting, so a high value does NOT by itself mean the clip is exciting)
 YOLO Score   : {yolo:.2f}   (relative object count - weak signal, low weight)
 OCR Score    : {ocr:.2f}   (relative on-screen reward/score text: e.g. WIN, VICTORY, LEVEL UP, COMBO, KILL, +points)
-Audio Score  : {audio:.2f}   (relative impact/event sounds. SUSTAINED loud, rapid-fire audio almost always means a real gunfight / firefight / combat; a quiet clip is almost always looting, walking, parachuting or menus - reject those)
+Audio Score  : {audio:.2f}   (relative impact/event sounds - gunfire, explosions, hits, impacts. Loud does NOT mean good: someone TALKING, commentary or music is loud too but is NOT a highlight. Only SHARP, rapid-fire event audio that lines up with visible on-screen action counts. If the audio is loud but the player is just standing / looting / walking, REJECT.)
 
 Summary:
 {chr(10).join(cv_summary)}
@@ -604,8 +607,9 @@ Summary:
      0-2  = boring filler: dropping in / parachuting / landing, idle standing,
             aimless walking / running / driving with no enemies, looting crates
             or bodies, picking up ammo / weapons / cash, crafting, menus,
-            inventory, map, shop, buy / respawn screens, or just wandering with
-            nothing happening - EVEN IF the camera moves a lot.
+            inventory, map, shop, buy / respawn screens, the character just
+            talking / standing with nothing happening, or just wandering -
+            EVEN IF the camera moves a lot OR the audio is loud.
      3-4  = minor activity but no real payoff.
      5-6  = a decent moment (a small fight, a nice bit of play).
      7-8  = a strong highlight (a clean kill / multi-kill, a clutch, a great
@@ -719,11 +723,14 @@ def parse_vision_response(data):
 
 def vision_failed(e):
 
+    # Fail CLOSED: a model timeout / error must NOT approve a clip, otherwise
+    # filler the model never actually judged (a looting or talking moment)
+    # slips through with a passing score. Reject it instead.
     return (
-        True,
-        True,
-        0.5,
-        0.5,
+        True,     # gameplay unknown - leave True so it isn't mistaken for "not a game"
+        False,    # approve
+        0.0,      # confidence
+        0.0,      # rating
         f"vision-failed: {e}"
     )
 
@@ -1927,6 +1934,14 @@ def load_clip_frames(
 SCAN_MAX_FRAMES = int(os.environ.get("SCAN_MAX_FRAMES", "700"))
 SCAN_WIDTH = int(os.environ.get("SCAN_WIDTH", "480"))
 
+# Low-res proxy settings. The whole detection stage analyses this proxy instead
+# of the heavy original (often 4K / AV1). The FINAL clips are still cut from the
+# untouched original in /render, so only analysis - never published quality -
+# is affected. Raise PROXY_HEIGHT (e.g. 900) if the vision model needs to read
+# finer detail; lower it (e.g. 540) to shave more time.
+PROXY_HEIGHT = int(os.environ.get("PROXY_HEIGHT", "720"))
+PROXY_FPS = int(os.environ.get("PROXY_FPS", "15"))
+
 
 def _minmax(values, flat=0.5):
     """Normalize a list to 0..1. Returns ``flat`` for every element when the
@@ -1976,46 +1991,63 @@ def _scan_motion(full, seg_dur, job_dir):
 
 
 def _audio_window_features(scan_times, audio, half=3.0):
-    """For every scan time compute two windowed audio features over +/- ``half``
-    seconds, both normalized 0..1 across the whole segment:
+    """For every scan time compute THREE windowed audio features over +/- ``half``
+    seconds, each normalized 0..1 across the whole segment. Audio is the single
+    most genre-agnostic 'something is actually happening' cue - gunfire, hits,
+    explosions, engine roars, crowd swells, goal horns, impacts - so we measure
+    it three complementary ways and weight it heavily downstream:
 
-      * sustained loudness - the MEAN loudness in the window. A real firefight
-        stays loud for seconds; a single looting 'ding' does not.
+      * sustained loudness - the MEAN loudness in the window. A real fight /
+        chase / rally stays loud for seconds; a single looting 'ding' does not.
       * transient energy   - the SUM of positive loudness JUMPS in the window.
-        Gunfire is many rapid transients back to back; walking, looting and
-        menus have almost none.
+        Rapid-fire events (gunfire, hits, impacts) are many transients back to
+        back; walking, looting and menus have almost none.
+      * dynamic range      - the loud-to-quiet SPREAD in the window. A dramatic
+        beat (a shot cracking over ambience, a sudden crash) has a wide spread;
+        flat menu / idle audio is nearly constant.
 
-    Together these are the single most reliable 'this is actual combat, not
-    someone wandering around' cue, and they are what the visual signals get
-    gated by. Returns ``([sus_loud], [transient])`` (zeros when no audio)."""
+    Returns ``([sus_loud], [transient], [dynamic])`` (all zeros when no audio)."""
     n = len(scan_times)
     if not audio or not audio[0]:
-        return [0.0] * n, [0.0] * n
+        return [0.0] * n, [0.0] * n, [0.0] * n
     at, av = audio
     if len(at) < 2 or not av:
-        return [0.0] * n, [0.0] * n
+        return [0.0] * n, [0.0] * n, [0.0] * n
     ahop = at[1] - at[0]
     if ahop <= 0:
-        return [0.0] * n, [0.0] * n
+        return [0.0] * n, [0.0] * n, [0.0] * n
 
+    # Clamp near-silence so one -inf-ish RMS sample can't dominate the spread.
+    avc = [max(-80.0, x) for x in av]
     # Positive loudness jumps between consecutive audio samples (dB rises).
-    jumps = [0.0] + [max(0.0, av[k] - av[k - 1]) for k in range(1, len(av))]
+    jumps = [0.0] + [max(0.0, avc[k] - avc[k - 1]) for k in range(1, len(avc))]
     w = max(1, int(round(half / ahop)))
 
     def idx(t):
-        return max(0, min(len(av) - 1, int(round((t - at[0]) / ahop))))
+        return max(0, min(len(avc) - 1, int(round((t - at[0]) / ahop))))
 
-    sus_raw, tr_raw = [], []
+    sus_raw, tr_raw, dyn_raw = [], [], []
     for t in scan_times:
         c = idx(t)
         lo = max(0, c - w)
-        hi = min(len(av), c + w + 1)
-        seg = av[lo:hi]
-        sus_raw.append(sum(seg) / len(seg) if seg else -120.0)
-        # Only count meaningful transients (>= 2 dB) so background hiss is ignored.
-        tr_raw.append(sum(j for j in jumps[lo:hi] if j >= 2.0))
+        hi = min(len(avc), c + w + 1)
+        seg = avc[lo:hi]
+        if seg:
+            sus_raw.append(sum(seg) / len(seg))
+            dyn_raw.append(max(seg) - min(seg))
+        else:
+            sus_raw.append(-80.0)
+            dyn_raw.append(0.0)
+        # Only count STRONG transients (>= 5 dB): gunfire, hits and explosions
+        # jump hard, while speech syllables and footsteps make only small
+        # ripples, so this keeps event audio and drops "someone talking".
+        tr_raw.append(sum(j for j in jumps[lo:hi] if j >= 5.0))
 
-    return _minmax(sus_raw, flat=0.0), _minmax(tr_raw, flat=0.0)
+    return (
+        _minmax(sus_raw, flat=0.0),
+        _minmax(tr_raw, flat=0.0),
+        _minmax(dyn_raw, flat=0.0),
+    )
 
 
 def _scan_scene_cuts(times, mvals):
@@ -2047,21 +2079,27 @@ def _build_activity(times, mvals, audio, step):
 
     This is the fix for 'it keeps picking looting / landing / walking': raw
     motion is maximised by parachuting, driving and camera panning, so it can
-    NEVER separate combat from traversal on its own. Instead we require BOTH:
+    NEVER separate real action from traversal on its own. Instead we require BOTH:
 
-      audio_energy = combat audio  (sustained loudness + rapid-fire transients)
+      audio_energy = event audio   (rapid-fire transients + dynamic range; NOT steady loudness / voice)
       visual       = motion novelty (burst above ~6s baseline) + sustained motion
 
-    and combine them so audio GATES the score:
+    and combine them so VISUAL action is REQUIRED and audio only BOOSTS it:
 
-      action = (0.30 + 0.70*audio_energy) * (0.35 + 0.65*visual)
+      action = visual * (0.25 + 0.75*audio_energy)
 
-    A moment with lots of motion but no combat audio (running, parachuting,
-    looting, panning) is capped low; a moment with sustained gunfire AND action
-    scores high. A 3-tap smoothing stops a single spike defining a peak."""
+    A moment with little on-screen action - looting, standing, slow roaming
+    while a voice talks - collapses no matter how loud it is (the fix for "one
+    clip is just the character speaking / picking up ammo"). Event audio then
+    lifts a moment that ALREADY has action (up to ~4x), so a real fight / chase
+    clearly outranks a quiet active one. A 3-tap smoothing stops a single spike
+    defining a peak.
+
+    Returns ``(activity, audio_energy, visual)`` - the visual curve is reused to
+    seed extra visually-led candidates for genre coverage."""
     n = len(times)
     if n == 0:
-        return []
+        return [], [], []
     mv = np.asarray(mvals, dtype=np.float32)
 
     # Motion novelty: how far above its own ~6s local baseline each sample sits.
@@ -2073,27 +2111,37 @@ def _build_activity(times, mvals, audio, step):
         baseline[i] = np.median(mv[lo:hi])
     nov = _minmax(np.clip(mv - baseline, 0.0, None).tolist(), flat=0.0)
 
-    # Sustained motion over ~3s (a firefight keeps moving; a single cut spikes
+    # Sustained motion over ~3s (real action keeps moving; a single cut spikes
     # once then settles).
     smw = max(1, int(round(3.0 / step)))
     sus_m_raw = [float(mv[max(0, i - smw):min(n, i + smw + 1)].mean()) for i in range(n)]
     sus_motion = _minmax(sus_m_raw, flat=0.0)
 
-    # Combat audio (sustained loud + transient density) over ~3s.
-    sus_loud, trans = _audio_window_features(times, audio, half=3.0)
+    # Event audio: transient density (rapid fire / impacts) + dynamic range.
+    # Sustained loudness is deliberately NOT used - it is high for someone
+    # talking, commentary or music, which is exactly the "nothing is happening"
+    # audio we must not reward.
+    sus_loud, trans, dyn = _audio_window_features(times, audio, half=3.0)
 
-    raw = []
+    audio_energy, visual, raw = [], [], []
     for i in range(n):
-        audio_energy = 0.60 * trans[i] + 0.40 * sus_loud[i]
-        visual = 0.60 * nov[i] + 0.40 * sus_motion[i]
-        raw.append(float((0.30 + 0.70 * audio_energy) * (0.35 + 0.65 * visual)))
+        ae = 0.65 * trans[i] + 0.35 * dyn[i]
+        vis = 0.55 * nov[i] + 0.45 * sus_motion[i]
+        audio_energy.append(ae)
+        visual.append(vis)
+        # VISUAL is required (multiplicative): if little is happening on screen -
+        # looting, standing, slow roaming while a voice talks - the moment
+        # collapses no matter how loud it is. Event audio then BOOSTS a moment
+        # that already has on-screen action (0.25x -> 1.0x), so a real fight
+        # clearly outranks a quiet active moment.
+        raw.append(float(vis * (0.25 + 0.75 * ae)))
 
-    out = []
+    activity = []
     for i in range(n):
         lo = max(0, i - 1)
         hi = min(n, i + 2)
-        out.append(float(sum(raw[lo:hi]) / (hi - lo)))
-    return out
+        activity.append(float(sum(raw[lo:hi]) / (hi - lo)))
+    return activity, audio_energy, visual
 
 
 def _pick_activity_peaks(times, activity, min_gap, k):
@@ -2112,6 +2160,67 @@ def _pick_activity_peaks(times, activity, min_gap, k):
         if len(chosen) >= k:
             break
     return sorted(chosen)
+
+
+def _dedup_times(times, min_gap):
+    """Collapse a merged list of candidate timestamps so no two kept moments
+    are closer than ``min_gap`` seconds - a moment surfaced by several curves
+    (activity, audio, visual) is the SAME moment. Returns chronological order."""
+    out = []
+    for t in sorted(times):
+        if not out or t - out[-1] >= min_gap:
+            out.append(t)
+    return out
+
+
+def _build_proxy(full, work_root):
+    """Transcode the (often 4K / AV1) source into ONE small proxy that every
+    analysis step then reads instead of the heavy original.
+
+    Decoding the original again and again - the dense motion scan, the hundreds
+    of frame seeks for the vision model, the scene / cut checks - was by far the
+    slowest part of the pipeline, and feeding the model full-4K stills also made
+    each inference slow and prone to time out. We pay the 4K decode cost exactly
+    ONCE here, write a light ~720p proxy (video + audio, dense keyframes so
+    segment splits stay accurate) and hand that to the whole detection stage.
+    The final clips are still cut from the untouched original in /render, so
+    published quality is unaffected.
+
+    Returns the proxy path, or None if the transcode failed (the caller then
+    falls back to analysing the original, preserving old behaviour)."""
+    proxy = os.path.join(work_root, "proxy.mp4")
+    t0 = time.time()
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", full,
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-vf", f"scale=-2:{PROXY_HEIGHT},fps={PROXY_FPS}",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        # Keyframe roughly every second so -c copy segment splits land cleanly.
+        "-g", str(PROXY_FPS), "-keyint_min", str(PROXY_FPS), "-sc_threshold", "0",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "96k",
+        proxy,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    ok = (
+        r.returncode == 0
+        and os.path.exists(proxy)
+        and os.path.getsize(proxy) > 0
+    )
+    if not ok:
+        print(
+            f"PROXY build FAILED (rc={r.returncode}); analysing the original.\n"
+            f"{(r.stderr or '')[-600:]}",
+            flush=True
+        )
+        return None
+    print(
+        f"PROXY built {PROXY_HEIGHT}p@{PROXY_FPS}fps in {time.time() - t0:.1f}s "
+        f"({os.path.getsize(proxy) // (1024 * 1024)} MB) -> {proxy}",
+        flush=True
+    )
+    return proxy
 
 
 def process_job(
@@ -2166,7 +2275,7 @@ def process_job(
     boundary_cuts = [t for (t, _s) in boundary_pairs]
     print(f"Derived {len(boundary_cuts)} scene cuts from the scan", flush=True)
 
-    activity = _build_activity(
+    activity, _audio_energy, visual = _build_activity(
         scan_t, scan_v, (audio_times, audio_vals), scan_step
     )
     print(
@@ -2175,17 +2284,25 @@ def process_job(
         flush=True
     )
 
-    # ---- 2) Candidate moments = peaks of the activity curve ----------------
+    # ---- 2) Candidate moments = peaks of SEVERAL curves --------------------
     # Generous shortlist so the vision model - the real judge of quality - gets
     # to see plenty of moments. The user is fine with longer processing for
     # better picks, so we err on the side of MORE candidates.
     n_scan = min(28, max(8, int(dur / max(1.0, clip_target * 0.6))))
-    peak_times = _pick_activity_peaks(
-        scan_t, activity,
-        min_gap=max(3.0, clip_target * 0.75),
-        k=n_scan
+    cand_gap = max(3.0, clip_target * 0.75)
+    # Main pool: the visual-gated, audio-boosted activity curve.
+    main_peaks = _pick_activity_peaks(scan_t, activity, cand_gap, n_scan)
+    # Genre coverage: also surface the most visually novel moments so a great
+    # play that happens to be quiet still reaches the vision model. We do NOT
+    # seed pure-audio peaks anymore - that was pulling in "loud but nothing
+    # happening" moments (someone talking, a looting ding).
+    visual_peaks = _pick_activity_peaks(scan_t, visual, cand_gap, max(2, n_scan // 3))
+    peak_times = _dedup_times(main_peaks + visual_peaks, cand_gap)
+    print(
+        f"Picked {len(peak_times)} candidate moments "
+        f"({len(main_peaks)} activity + {len(visual_peaks)} visual)",
+        flush=True
     )
-    print(f"Picked {len(peak_times)} candidate moments", flush=True)
 
     # Local window (seconds each side) used to place the clip bounds. We reuse
     # the dense scan series here - NO extra video decode per candidate.
@@ -2228,13 +2345,13 @@ def process_job(
     normalize_feature(cands, "motion", "motion_norm")
     cands.sort(
         key=lambda x: (
-            x["activity_norm"] * 0.55
-            + x["audio_norm"] * 0.30
+            x["activity_norm"] * 0.60
+            + x["audio_norm"] * 0.25
             + x["motion_norm"] * 0.15
         ),
         reverse=True
     )
-    vision_n = min(len(cands), max(inp.finalCandidates * 4, 12))
+    vision_n = min(len(cands), max(inp.finalCandidates * 5, 14))
     vis = cands[:vision_n]
 
     # ---- 4) VISION MODEL judges each candidate (the real intelligence) -----
@@ -2272,24 +2389,54 @@ def process_job(
     # A hard quality floor (>= 4/10) is what stops the pipeline padding the
     # result with filler - a dull segment now returns FEWER, better clips
     # instead of map/menu/looting shots just to reach finalCandidates.
-    RATING_FLOOR = 0.40   # 4 out of 10
+    # Which moments are worth keeping? We TRUST the model's approve flag: if it
+    # said the clip is postable gameplay, we keep it even at a modest rating.
+    # Requiring >= 4/10 as WELL was quietly collapsing eventful videos to a
+    # single clip, because qwen often APPROVES a real fight but rates it 3-4.
+    # Filler (menus, ads, looting, "just someone talking") is approve=false and
+    # its rating is capped low, so it is still excluded.
+    RATING_FLOOR = 0.40   # a "strong highlight" - used only to ORDER clips
+    KEEP_FLOOR = 0.25     # an approved clip at least this good is worth keeping
+
+    # Diagnostics: make the log say EXACTLY why we end up with N clips.
+    n_fail = sum(1 for f in vis if str(f.get("reason", "")).startswith("vision-failed"))
+    n_gp = sum(1 for f in vis if f.get("gameplay"))
+    n_appr = sum(1 for f in vis if f.get("gameplay") and f.get("approve"))
+    n_strong = sum(
+        1 for f in vis
+        if f.get("gameplay") and f.get("approve") and f.get("rating", 0.0) >= RATING_FLOOR
+    )
+    print(
+        f"Vision verdict on {len(vis)} moments: gameplay={n_gp} approved={n_appr} "
+        f"strong(>={RATING_FLOOR:.2f})={n_strong} vision_failed={n_fail}",
+        flush=True
+    )
+
     approved = [
         f for f in vis
         if f.get("gameplay") and f.get("approve")
-        and f.get("rating", 0.0) >= RATING_FLOOR
+        and f.get("rating", 0.0) >= KEEP_FLOOR
     ]
     if not approved:
-        # Whole segment was genuinely dull: keep ONLY the single best-rated
-        # moment so the flow still gets something, rather than filler.
+        # The model approved nothing. Keep the single best-rated gameplay
+        # moment so the flow still produces something (never a menu / ad /
+        # static frame). If the model FAILED on everything this is where a
+        # broken vision backend shows up - the log line above will say so.
+        gp = [f for f in vis if f.get("gameplay")] or vis
         approved = sorted(
-            vis, key=lambda x: x.get("rating", 0.0), reverse=True
+            gp, key=lambda x: x.get("rating", 0.0), reverse=True
         )[:1]
         print(
-            "No moment cleared the quality floor; keeping best-rated only.",
+            "No moment was approved; keeping the best-rated gameplay moment only.",
             flush=True
         )
+    # Strong highlights (>= RATING_FLOOR) lead, then by rating, then activity.
     approved.sort(
-        key=lambda x: (x.get("rating", 0.0), x.get("activity_norm", 0.0)),
+        key=lambda x: (
+            1 if x.get("rating", 0.0) >= RATING_FLOOR else 0,
+            x.get("rating", 0.0),
+            x.get("activity_norm", 0.0),
+        ),
         reverse=True
     )
 
@@ -2343,9 +2490,9 @@ def process_job(
         # clip with real sustained gunfire ranks above a quieter one the model
         # rated similarly. audio/motion stay as light tie-breakers.
         frame["final_score"] = round(
-            frame.get("rating", 0.0) * 0.72
-            + frame["activity_norm"] * 0.16
-            + frame["audio_norm"] * 0.08
+            frame.get("rating", 0.0) * 0.66
+            + frame["activity_norm"] * 0.20
+            + frame["audio_norm"] * 0.10
             + frame["motion_norm"] * 0.04,
             4
         )
@@ -2387,6 +2534,15 @@ def candidates(inp: CandIn):
     full = os.path.join(MEDIA, inp.path)
     dur = probe(ProbeIn(path=inp.path))["duration"]
     jobs = split_video_jobs(dur)
+
+    # Everything below analyses a light proxy of the source instead of the raw
+    # 4K/AV1 file - one decode here replaces dozens of heavy ones and keeps the
+    # vision model's stills small (faster, fewer timeouts). The final clips are
+    # still cut from the original in /render, so published quality is unchanged.
+    work_root = os.path.join(MEDIA, "work", inp.jobId)
+    os.makedirs(work_root, exist_ok=True)
+    proxy = _build_proxy(full, work_root)
+    analysis_src = proxy if proxy else full
 
     print(
         "\n========== VIDEO JOBS ==========",
@@ -2434,7 +2590,7 @@ def candidates(inp: CandIn):
 
         if len(jobs) == 1:
 
-            segment = full
+            segment = analysis_src
 
         else:
 
@@ -2444,7 +2600,7 @@ def candidates(inp: CandIn):
             )
 
             split_video(
-                full,
+                analysis_src,
                 job["start"],
                 job["end"],
                 segment
@@ -2470,6 +2626,14 @@ def candidates(inp: CandIn):
             frame["segment"] = job["job"] if len(jobs) > 1 else 0
 
         all_selected.extend(selected)
+
+    # The proxy has served its purpose (all analysis is done); drop it so it
+    # doesn't linger in the work dir. Renders/edits use the original source.
+    if proxy and os.path.exists(proxy):
+        try:
+            os.remove(proxy)
+        except OSError:
+            pass
 
     #print("INPUT PATH:", repr(inp.path))
     #info = probe(ProbeIn(path=inp.path))
@@ -2503,11 +2667,24 @@ def candidates(inp: CandIn):
         ):
             final.append(frame)
 
-    # Optional overall cap across the whole video (all segments combined).
-    # final is already sorted by final_score, so we keep the highest scored.
-    if inp.maxCandidates and inp.maxCandidates > 0:
-        final = final[:inp.maxCandidates]
+    # Overall cap across the whole video (all segments combined). The agreed
+    # behaviour is "at most finalCandidates clips total" (default 3) - so even a
+    # long, multi-segment video returns AT MOST 3 (fewer when the content is
+    # thin). maxCandidates, when set, overrides this.
+    total_cap = (
+        inp.maxCandidates
+        if (inp.maxCandidates and inp.maxCandidates > 0)
+        else inp.finalCandidates
+    )
+    if total_cap and total_cap > 0:
+        final = final[:total_cap]
 
+    print(
+        f"/candidates: returning {len(final)} clip(s) "
+        f"(cap={total_cap}) from {len(jobs)} segment(s); "
+        f"{len(all_selected)} found before merge",
+        flush=True
+    )
     # final is already sorted best -> worst by final_score. Stamp a global rank
     # for overall posting order, plus a per-segment rank so each segment's
     # render folder gets clip_1, clip_2, ... independently.
